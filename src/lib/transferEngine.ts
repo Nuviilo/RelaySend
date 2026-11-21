@@ -1,15 +1,32 @@
 import type {DeviceType, PeerInfo, RoomState, TransferItem, TransportMode} from '../types';
+import {MqttMesh} from './mqttMesh';
 import {getWsUrl} from './serverConfig';
 
+const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 const CHUNK_SIZE = 48 * 1024; // 48 KB — safe for WebRTC SCTP and smooth for WS relay
+const MQTT_CHUNK_SIZE = 24 * 1024; // 24 KB — fits well below public MQTT packet limits
 const MAX_DC_BUFFERED = 1024 * 1024; // 1 MB
-const RELAY_ACK_INTERVAL = 32; // Ack every 32 chunks (~1.5 MB)
+const RELAY_ACK_INTERVAL = 32; // Ack every 32 chunks
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     {urls: 'stun:stun.l.google.com:19302'},
     {urls: 'stun:stun1.l.google.com:19302'},
   ],
 };
+
+function generateLocalRoomCode(): string {
+  const bytes = new Uint8Array(6);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 6; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+  }
+  return code;
+}
 
 interface FileSystemWritableLike {
   write: (data: Uint8Array<ArrayBuffer>) => Promise<void>;
@@ -84,8 +101,14 @@ const textDecoder = new TextDecoder();
 
 export class TransferEngine {
   private ws: WebSocket | null = null;
+  private mqtt: MqttMesh | null = null;
   private reconnectTimer: number | null = null;
   private destroyed = false;
+
+  private wsConnected = false;
+  private mqttConnected = false;
+  private wsPeers: PeerInfo[] = [];
+  private mqttPeers: PeerInfo[] = [];
 
   private clientId: string;
   private deviceName: string;
@@ -116,7 +139,10 @@ export class TransferEngine {
     this.clientId = this.loadOrCreateClientId();
     this.deviceName = options.name;
     this.deviceType = options.deviceType;
-    this.requestedRoomCode = options.initialRoomCode || '';
+    const initialCode = options.initialRoomCode || generateLocalRoomCode();
+    this.requestedRoomCode = initialCode;
+    this.roomState.myId = this.clientId;
+    this.roomState.roomCode = initialCode;
   }
 
   private loadOrCreateClientId(): string {
@@ -167,21 +193,68 @@ export class TransferEngine {
 
   connect(): void {
     if (this.destroyed) return;
+    this.ensureMqttStarted();
+    this.connectWs();
+  }
+
+  private ensureMqttStarted(): void {
+    if (this.mqtt || this.destroyed) return;
+    this.mqtt = new MqttMesh({
+      clientId: this.clientId,
+      name: this.deviceName,
+      deviceType: this.deviceType,
+      roomCode: this.roomState.roomCode,
+      callbacks: {
+        onStatusChange: (connected) => {
+          this.mqttConnected = connected;
+          this.roomState.connected = this.wsConnected || this.mqttConnected;
+          this.roomState.reconnecting = !this.roomState.connected && !this.destroyed;
+          this.emit();
+        },
+        onPeersChange: (peers) => {
+          this.mqttPeers = peers;
+          this.mergeAndSyncPeers();
+        },
+        onDirectJson: (from, msg) => {
+          this.handleIncomingPeerEnvelope(from, msg);
+        },
+        onDirectBinary: (_from, transferId, chunk) => {
+          this.appendIncomingChunk(transferId, chunk, 'relay');
+        },
+      },
+    });
+    this.mqtt.start();
+  }
+
+  private connectWs(): void {
+    if (this.destroyed) return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
-    const wsUrl = getWsUrl();
-    const ws = new WebSocket(wsUrl);
+    let wsUrl: string;
+    try {
+      wsUrl = getWsUrl();
+    } catch {
+      return;
+    }
+
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch {
+      return;
+    }
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
 
     ws.onopen = () => {
+      this.wsConnected = true;
       this.roomState.connected = true;
       this.roomState.reconnecting = false;
-      this.sendJson({
+      this.sendWsJson({
         type: 'join',
-        roomCode: this.requestedRoomCode || this.roomState.roomCode || undefined,
+        roomCode: this.requestedRoomCode || this.roomState.roomCode,
         name: this.deviceName,
         deviceType: this.deviceType,
         clientId: this.clientId,
@@ -201,19 +274,19 @@ export class TransferEngine {
       if (this.ws === ws) {
         this.ws = null;
       }
-      this.roomState.connected = false;
-      this.roomState.reconnecting = !this.destroyed;
-      this.failActiveTransfers('Connection lost');
-      this.closeAllRtc();
-      this.emit();
+      this.wsConnected = false;
+      this.wsPeers = [];
+      this.roomState.connected = this.mqttConnected;
+      this.roomState.reconnecting = !this.roomState.connected && !this.destroyed;
+      this.mergeAndSyncPeers();
 
       if (!this.destroyed) {
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
         }
         this.reconnectTimer = window.setTimeout(() => {
-          this.connect();
-        }, 1500);
+          this.connectWs();
+        }, 4000);
       }
     };
 
@@ -229,6 +302,10 @@ export class TransferEngine {
       this.reconnectTimer = null;
     }
     this.closeAllRtc();
+    if (this.mqtt) {
+      this.mqtt.destroy();
+      this.mqtt = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -247,21 +324,31 @@ export class TransferEngine {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.wsConnected = false;
+    this.wsPeers = [];
     this.closeAllRtc();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
-    this.connect();
+    this.mergeAndSyncPeers();
+    this.connectWs();
   }
 
   joinRoom(code: string): void {
-    this.requestedRoomCode = code;
+    const nextCode = code || generateLocalRoomCode();
+    this.requestedRoomCode = nextCode;
+    this.roomState.roomCode = nextCode;
+    this.wsPeers = [];
+    this.mqttPeers = [];
     this.closeAllRtc();
+    this.mergeAndSyncPeers();
+    this.mqtt?.setRoomCode(nextCode);
+
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.sendJson({
+      this.sendWsJson({
         type: 'join',
-        roomCode: code || undefined,
+        roomCode: nextCode,
         name: this.deviceName,
         deviceType: this.deviceType,
         clientId: this.clientId,
@@ -272,38 +359,54 @@ export class TransferEngine {
   }
 
   createNewRoom(): void {
-    this.requestedRoomCode = '';
-    this.roomState.roomCode = '';
-    this.closeAllRtc();
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.sendJson({
-        type: 'join',
-        name: this.deviceName,
-        deviceType: this.deviceType,
-        clientId: this.clientId,
-      });
-    } else {
-      this.connect();
-    }
+    this.joinRoom(generateLocalRoomCode());
   }
 
   renameDevice(newName: string): void {
     const trimmed = newName.trim().slice(0, 48);
     if (!trimmed) return;
     this.deviceName = trimmed;
+    this.mqtt?.setDeviceName(trimmed);
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.sendJson({type: 'rename', name: trimmed});
+      this.sendWsJson({type: 'rename', name: trimmed});
     }
   }
 
-  private sendJson(data: unknown): void {
+  private sendWsJson(data: unknown): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     }
   }
 
+  private isWsPeer(peerId: string): boolean {
+    return this.wsConnected && this.wsPeers.some((p) => p.id === peerId);
+  }
+
+  private sendPeerEnvelope(to: string, data: Record<string, unknown>): void {
+    if (this.isWsPeer(to)) {
+      this.sendWsJson({...data, to});
+    } else {
+      this.mqtt?.sendDirectJson(to, data);
+    }
+  }
+
   private sendSignal(to: string, payload: Record<string, unknown>): void {
-    this.sendJson({type: 'signal', to, payload});
+    this.sendPeerEnvelope(to, {type: 'signal', payload});
+  }
+
+  private mergeAndSyncPeers(): void {
+    const myId = this.roomState.myId || this.clientId;
+    const mergedMap = new Map<string, PeerInfo>();
+    for (const p of this.wsPeers) {
+      if (p.id !== myId) mergedMap.set(p.id, p);
+    }
+    for (const p of this.mqttPeers) {
+      if (p.id !== myId && !mergedMap.has(p.id)) {
+        mergedMap.set(p.id, p);
+      }
+    }
+    this.syncPeers(Array.from(mergedMap.values()));
+    this.emit();
   }
 
   private handleTextMessage(raw: string): void {
@@ -317,24 +420,30 @@ export class TransferEngine {
     const type = msg.type;
     if (type === 'joined') {
       this.roomState.myId = String(msg.clientId || this.clientId);
-      this.roomState.roomCode = String(msg.roomCode || '');
-      this.requestedRoomCode = this.roomState.roomCode;
-      const peers = Array.isArray(msg.peers) ? (msg.peers as PeerInfo[]) : [];
-      this.syncPeers(peers);
-      this.emit();
+      const serverCode = String(msg.roomCode || '');
+      if (serverCode) {
+        this.roomState.roomCode = serverCode;
+        this.requestedRoomCode = serverCode;
+        this.mqtt?.setRoomCode(serverCode);
+      }
+      this.wsPeers = Array.isArray(msg.peers) ? (msg.peers as PeerInfo[]) : [];
+      this.mergeAndSyncPeers();
       return;
     }
 
     if (type === 'room:peers') {
-      const peers = Array.isArray(msg.peers) ? (msg.peers as PeerInfo[]) : [];
-      this.syncPeers(peers);
-      this.emit();
+      this.wsPeers = Array.isArray(msg.peers) ? (msg.peers as PeerInfo[]) : [];
+      this.mergeAndSyncPeers();
       return;
     }
 
     const from = typeof msg.from === 'string' ? msg.from : '';
     if (!from) return;
+    this.handleIncomingPeerEnvelope(from, msg);
+  }
 
+  private handleIncomingPeerEnvelope(from: string, msg: Record<string, unknown>): void {
+    const type = msg.type;
     if (type === 'rtc:offer') {
       void this.handleRtcOffer(from, msg.payload as RTCSessionDescriptionInit);
       return;
@@ -412,9 +521,8 @@ export class TransferEngine {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        this.sendJson({
+        this.sendPeerEnvelope(peerId, {
           type: 'rtc:ice',
-          to: peerId,
           payload: event.candidate.toJSON(),
         });
       }
@@ -451,9 +559,8 @@ export class TransferEngine {
 
       const offer = await entry.pc.createOffer();
       await entry.pc.setLocalDescription(offer);
-      this.sendJson({
+      this.sendPeerEnvelope(peerId, {
         type: 'rtc:offer',
-        to: peerId,
         payload: entry.pc.localDescription,
       });
     } catch {
@@ -479,9 +586,8 @@ export class TransferEngine {
 
       const answer = await entry.pc.createAnswer();
       await entry.pc.setLocalDescription(answer);
-      this.sendJson({
+      this.sendPeerEnvelope(peerId, {
         type: 'rtc:answer',
-        to: peerId,
         payload: entry.pc.localDescription,
       });
     } catch {
@@ -593,7 +699,9 @@ export class TransferEngine {
 
     const dc = this.rtcPeers.get(job.peerId)?.dc;
     const useP2P = Boolean(dc && dc.readyState === 'open');
+    const useWsRelay = !useP2P && this.isWsPeer(job.peerId);
     const transport: TransportMode = useP2P ? 'p2p' : 'relay';
+    const chunkSize = !useP2P && !useWsRelay ? MQTT_CHUNK_SIZE : CHUNK_SIZE;
 
     item.status = 'transferring';
     item.transport = transport;
@@ -616,7 +724,7 @@ export class TransferEngine {
           return;
         }
 
-        const end = Math.min(offset + CHUNK_SIZE, job.file.size);
+        const end = Math.min(offset + chunkSize, job.file.size);
         const sliceBuffer = await job.file.slice(offset, end).arrayBuffer();
         const chunk = new Uint8Array(sliceBuffer);
 
@@ -630,10 +738,7 @@ export class TransferEngine {
           frame.set(transferIdBytes, 2);
           frame.set(chunk, 2 + transferIdBytes.length);
           dc.send(frame);
-        } else {
-          if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            throw new Error('Connection closed');
-          }
+        } else if (useWsRelay && this.ws && this.ws.readyState === WebSocket.OPEN) {
           while (this.ws.bufferedAmount > MAX_DC_BUFFERED) {
             await new Promise((r) => window.setTimeout(r, 20));
           }
@@ -657,6 +762,24 @@ export class TransferEngine {
               };
             });
           }
+        } else if (this.mqtt && this.mqtt.isConnected()) {
+          const sent = this.mqtt.sendDirectBinary(job.peerId, job.id, chunk);
+          if (!sent) {
+            throw new Error('Connection closed');
+          }
+          chunksSinceAck++;
+          if (chunksSinceAck >= RELAY_ACK_INTERVAL && end < job.file.size) {
+            chunksSinceAck = 0;
+            await new Promise<void>((resolve) => {
+              const timeout = window.setTimeout(resolve, 4000);
+              job.ackResolver = () => {
+                window.clearTimeout(timeout);
+                resolve();
+              };
+            });
+          }
+        } else {
+          throw new Error('Connection closed');
         }
 
         offset = end;

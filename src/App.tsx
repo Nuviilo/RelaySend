@@ -106,7 +106,7 @@ export default function App() {
   const [selectedPeerIds, setSelectedPeerIds] = useState<string[]>([]);
 
   const [joinInput, setJoinInput] = useState('');
-  const [showQr, setShowQr] = useState(false);
+  const [showQr, setShowQr] = useState(true);
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
   const [autoAccept, setAutoAccept] = useState(false);
