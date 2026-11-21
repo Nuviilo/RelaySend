@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#FAFAFA" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>Relay — Device File Sharing</title>
+    <meta name="description" content="Connect devices anywhere and share files of any size." />
+    <meta property="og:title" content="Relay — Device File Sharing" />
+    <meta property="og:description" content="Connect devices anywhere and share files of any size." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('relay_theme');
+          var dark =
+            saved === 'dark' ||
+            (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) {
+            document.documentElement.classList.add('dark');
+            var meta = document.querySelector('meta[name="theme-color"]');
+            if (meta) meta.setAttribute('content', '#09090B');
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script type="module" crossorigin src="./assets/index-BkbF7isq.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-f2hhluIr.css">
+  </head>
+  <body class="bg-[#FAFAFA] text-[#09090B] antialiased selection:bg-blue-600 selection:text-white dark:bg-zinc-950 dark:text-zinc-100">
+    <div id="root"></div>
+  </body>
+</html>

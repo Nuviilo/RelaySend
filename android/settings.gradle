@@ -1,0 +1,57 @@
+def projectRoot = settingsDir.parentFile
+def capacitorAndroidDir = new File(projectRoot, 'node_modules/@capacitor/android/capacitor')
+def webBundleIndex = new File(settingsDir, 'app/src/main/assets/public/index.html')
+
+def resolveNpm = {
+    def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
+    if (isWindows) {
+        def candidates = [
+            new File(System.getenv('ProgramFiles') ?: 'C:\\Program Files', 'nodejs\\npm.cmd'),
+            new File(System.getenv('LOCALAPPDATA') ?: '', 'Programs\\nodejs\\npm.cmd'),
+            'npm.cmd'
+        ]
+        for (c in candidates) {
+            if (c instanceof File && c.exists()) return c.absolutePath
+        }
+        return 'npm.cmd'
+    } else {
+        def candidates = [
+            new File('/opt/homebrew/bin/npm'),
+            new File('/usr/local/bin/npm'),
+            new File('/usr/bin/npm')
+        ]
+        for (c in candidates) {
+            if (c.exists()) return c.absolutePath
+        }
+        return 'npm'
+    }
+}
+
+def runNpm = { List<String> args ->
+    def npmBin = resolveNpm()
+    def cmd = [npmBin] + args
+    println "[Relay] Running: ${cmd.join(' ')}"
+    def proc = new ProcessBuilder(cmd)
+        .directory(projectRoot)
+        .redirectErrorStream(true)
+        .start()
+    proc.inputStream.eachLine { println "[Relay] ${it}" }
+    def exitCode = proc.waitFor()
+    if (exitCode != 0) {
+        throw new GradleException("Relay setup failed (${cmd.join(' ')}) with exit code ${exitCode}. Ensure Node.js is installed.")
+    }
+}
+
+if (!capacitorAndroidDir.exists()) {
+    runNpm(['install'])
+}
+
+if (!webBundleIndex.exists()) {
+    runNpm(['run', 'cap:sync'])
+}
+
+include ':app'
+include ':capacitor-cordova-android-plugins'
+project(':capacitor-cordova-android-plugins').projectDir = new File('./capacitor-cordova-android-plugins/')
+
+apply from: 'capacitor.settings.gradle'
