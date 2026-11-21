@@ -30,6 +30,7 @@ export interface TransferItem {
   speedBps: number;
   transport?: TransportMode;
   downloadUrl?: string;
+  savedToDownloads?: boolean;
   error?: string;
 }
 

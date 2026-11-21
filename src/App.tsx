@@ -725,7 +725,9 @@ export default function App() {
                               {item.status === 'completed' && (
                                 <>
                                   <span aria-hidden="true">·</span>
-                                  <span className="text-zinc-700 dark:text-zinc-300">Done</span>
+                                  <span className="text-zinc-700 dark:text-zinc-300">
+                                    {item.savedToDownloads ? 'Saved to Downloads' : 'Done'}
+                                  </span>
                                 </>
                               )}
                               {item.status === 'cancelled' && (

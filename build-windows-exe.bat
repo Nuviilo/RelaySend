@@ -23,14 +23,12 @@ if errorlevel 1 (
 )
 
 echo [1/4] Installing app dependencies...
-if not exist "node_modules" (
-    call npm install
-    if errorlevel 1 goto :error
-)
+call npm install --no-audit --no-fund --legacy-peer-deps
+if errorlevel 1 goto :error
 
-if not exist "node_modules\electron" (
+if not exist "node_modules\electron\package.json" (
     echo [2/4] Installing Electron and Electron Builder...
-    call npm install --no-save -D electron electron-builder
+    call npm install --no-save --no-audit --no-fund --legacy-peer-deps -D electron electron-builder
     if errorlevel 1 goto :error
 ) else (
     echo [2/4] Electron tools already installed.
@@ -47,6 +45,7 @@ call npm run build
 if errorlevel 1 goto :error
 
 echo [4/4] Packaging Windows .exe...
+set CSC_IDENTITY_AUTO_DISCOVERY=false
 call npx electron-builder --win
 if errorlevel 1 goto :error
 

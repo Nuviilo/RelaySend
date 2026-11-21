@@ -23,6 +23,21 @@ interface SaveFilePickerWindow extends Window {
   }) => Promise<{
     createWritable: () => Promise<FileSystemWritableLike>;
   }>;
+  RelayAndroid?: {
+    startFile: (transferId: string, fileName: string, mimeType: string) => boolean;
+    appendChunk: (transferId: string, base64Chunk: string) => boolean;
+    finishFile: (transferId: string) => boolean;
+    abortFile: (transferId: string) => void;
+  };
+}
+
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const step = 0x4000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + step));
+  }
+  return btoa(binary);
 }
 
 interface OutgoingJob {
@@ -49,6 +64,7 @@ interface IncomingJob {
   lastSpeedBytes: number;
   transport: TransportMode;
   writable: FileSystemWritableLike | null;
+  androidSink: boolean;
   memoryChunks: Uint8Array<ArrayBuffer>[];
   writeChain: Promise<void>;
   finalized: boolean;
@@ -711,26 +727,35 @@ export class TransferEngine {
     const item = this.transfers.get(transferId);
     if (!job || !item || job.accepted || job.cancelled) return;
 
+    const bridgeWin = window as SaveFilePickerWindow;
     let writable: FileSystemWritableLike | null = null;
-    if (usePicker) {
-      const pickerWin = window as SaveFilePickerWindow;
-      if (typeof pickerWin.showSaveFilePicker === 'function') {
-        try {
-          const handle = await pickerWin.showSaveFilePicker({
-            suggestedName: job.name,
-          });
-          writable = await handle.createWritable();
-        } catch (err) {
-          if (err instanceof DOMException && err.name === 'AbortError') {
-            return;
-          }
-          // Fall back cleanly to Blob streaming if blocked (e.g. iframe / unsupported)
-          writable = null;
+    let androidSink = false;
+
+    if (bridgeWin.RelayAndroid) {
+      try {
+        androidSink = bridgeWin.RelayAndroid.startFile(job.id, job.name, job.mimeType);
+      } catch {
+        androidSink = false;
+      }
+    }
+
+    if (!androidSink && usePicker && typeof bridgeWin.showSaveFilePicker === 'function') {
+      try {
+        const handle = await bridgeWin.showSaveFilePicker({
+          suggestedName: job.name,
+        });
+        writable = await handle.createWritable();
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
         }
+        // Fall back cleanly to Blob streaming if blocked (e.g. iframe / unsupported)
+        writable = null;
       }
     }
 
     job.writable = writable;
+    job.androidSink = androidSink;
     job.accepted = true;
     job.lastSpeedTime = performance.now();
     item.status = 'transferring';
@@ -763,6 +788,9 @@ export class TransferEngine {
     if (inJob) {
       inJob.cancelled = true;
       void inJob.writable?.abort?.().catch(() => {});
+      if (inJob.androidSink) {
+        (window as SaveFilePickerWindow).RelayAndroid?.abortFile(inJob.id);
+      }
       inJob.memoryChunks = [];
       this.incomingJobs.delete(transferId);
       this.sendSignal(item.peerId, {kind: 'transfer:cancel', transferId});
@@ -841,6 +869,7 @@ export class TransferEngine {
         lastSpeedBytes: 0,
         transport: 'relay',
         writable: null,
+        androidSink: false,
         memoryChunks: [],
         writeChain: Promise.resolve(),
         finalized: false,
@@ -899,6 +928,9 @@ export class TransferEngine {
       if (inJob) {
         inJob.cancelled = true;
         void inJob.writable?.abort?.().catch(() => {});
+        if (inJob.androidSink) {
+          (window as SaveFilePickerWindow).RelayAndroid?.abortFile(inJob.id);
+        }
         inJob.memoryChunks = [];
         this.incomingJobs.delete(transferId);
       }
@@ -949,7 +981,14 @@ export class TransferEngine {
     job.bytesReceived += chunk.length;
     job.chunksReceived += 1;
 
-    if (job.writable) {
+    if (job.androidSink) {
+      const bridge = (window as SaveFilePickerWindow).RelayAndroid;
+      job.writeChain = job.writeChain.then(() => {
+        if (!bridge?.appendChunk(job.id, uint8ToBase64(chunk))) {
+          throw new Error('Failed writing to Downloads');
+        }
+      });
+    } else if (job.writable) {
       const writable = job.writable;
       job.writeChain = job.writeChain.then(() => writable.write(chunk));
     } else {
@@ -988,7 +1027,13 @@ export class TransferEngine {
 
     try {
       await job.writeChain;
-      if (job.writable) {
+      if (job.androidSink) {
+        const ok = (window as SaveFilePickerWindow).RelayAndroid?.finishFile(job.id);
+        if (!ok) {
+          throw new Error('Could not finalize file in Downloads');
+        }
+        item.savedToDownloads = true;
+      } else if (job.writable) {
         await job.writable.close();
         job.writable = null;
       } else {
@@ -1041,6 +1086,9 @@ export class TransferEngine {
         if (inJob) {
           inJob.cancelled = true;
           void inJob.writable?.abort?.().catch(() => {});
+          if (inJob.androidSink) {
+            (window as SaveFilePickerWindow).RelayAndroid?.abortFile(inJob.id);
+          }
         }
       }
     }
