@@ -553,12 +553,21 @@ export default function App() {
     engineRef.current?.setAutoAccept(next);
   };
 
+  const hasNativeDownloads = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    const w = window as unknown as {
+      RelayAndroid?: unknown;
+      relayDesktop?: {startFile?: unknown};
+    };
+    return Boolean(w.RelayAndroid || w.relayDesktop?.startFile);
+  }, []);
+
   const hasFinishedTransfers = transfers.some(
     (t) => t.status === 'completed' || t.status === 'cancelled' || t.status === 'error',
   );
 
-  const waitingReceiveCount = transfers.filter(
-    (t) => t.direction === 'receive' && t.status === 'waiting',
+  const saveableCompletedCount = transfers.filter(
+    (t) => t.direction === 'receive' && t.status === 'completed' && Boolean(t.downloadUrl),
   ).length;
 
   const targetSummary =
@@ -1061,37 +1070,49 @@ export default function App() {
                 <h2 className="text-sm font-semibold text-zinc-950 dark:text-zinc-100">Transfers</h2>
 
                 <div className="flex items-center gap-3.5">
-                  {waitingReceiveCount > 1 && (
+                  {saveableCompletedCount > 1 && (
                     <button
                       type="button"
-                      onClick={() => void engineRef.current?.acceptAllIncomingTransfers()}
+                      onClick={() => void engineRef.current?.saveAllCompletedTransfers()}
                       className="inline-flex h-7 items-center gap-1.5 rounded-md bg-blue-600 px-2.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
                     >
                       <Download className="h-3 w-3" />
-                      <span>Save all ({waitingReceiveCount})</span>
+                      <span>Save all ({saveableCompletedCount})</span>
                     </button>
                   )}
 
-                  <button
-                    type="button"
-                    onClick={handleToggleAutoAccept}
-                    role="switch"
-                    aria-checked={autoAccept}
-                    className="inline-flex items-center gap-2 text-xs font-medium text-zinc-600 hover:text-zinc-950 dark:text-zinc-400 dark:hover:text-zinc-100 whitespace-nowrap shrink-0"
-                  >
-                    <span>Auto-save</span>
-                    <span
-                      className={`inline-flex h-4 w-7 items-center rounded-full p-0.5 transition-colors ${
-                        autoAccept ? 'bg-blue-600' : 'bg-zinc-200 dark:bg-zinc-700'
-                      }`}
+                  {activeTransfersCount > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => engineRef.current?.cancelAllActiveTransfers()}
+                      className="text-xs font-medium text-zinc-500 hover:text-zinc-950 dark:text-zinc-400 dark:hover:text-zinc-100 whitespace-nowrap shrink-0"
                     >
+                      Cancel all
+                    </button>
+                  )}
+
+                  {!hasNativeDownloads && (
+                    <button
+                      type="button"
+                      onClick={handleToggleAutoAccept}
+                      role="switch"
+                      aria-checked={autoAccept}
+                      className="inline-flex items-center gap-2 text-xs font-medium text-zinc-600 hover:text-zinc-950 dark:text-zinc-400 dark:hover:text-zinc-100 whitespace-nowrap shrink-0"
+                    >
+                      <span>Auto-save</span>
                       <span
-                        className={`h-3 w-3 rounded-full bg-white transition-transform ${
-                          autoAccept ? 'translate-x-3' : 'translate-x-0'
+                        className={`inline-flex h-4 w-7 items-center rounded-full p-0.5 transition-colors ${
+                          autoAccept ? 'bg-blue-600' : 'bg-zinc-200 dark:bg-zinc-700'
                         }`}
-                      />
-                    </span>
-                  </button>
+                      >
+                        <span
+                          className={`h-3 w-3 rounded-full bg-white transition-transform ${
+                            autoAccept ? 'translate-x-3' : 'translate-x-0'
+                          }`}
+                        />
+                      </span>
+                    </button>
+                  )}
 
                   {hasFinishedTransfers && (
                     <button
@@ -1152,11 +1173,7 @@ export default function App() {
                               {item.status === 'waiting' && (
                                 <>
                                   <span aria-hidden="true">·</span>
-                                  <span>
-                                    {item.direction === 'send'
-                                      ? 'Waiting for device'
-                                      : 'Ready to save'}
-                                  </span>
+                                  <span>Queued</span>
                                 </>
                               )}
                               {item.status === 'completed' && (
@@ -1185,17 +1202,6 @@ export default function App() {
                           </div>
 
                           <div className="flex items-center gap-2 shrink-0">
-                            {item.direction === 'receive' && item.status === 'waiting' && (
-                              <button
-                                type="button"
-                                onClick={() => engineRef.current?.acceptIncomingTransfer(item.id)}
-                                className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-blue-600 px-3 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
-                              >
-                                <Download className="h-3.5 w-3.5" />
-                                <span>Save</span>
-                              </button>
-                            )}
-
                             {item.status === 'completed' && item.downloadUrl && (
                               <a
                                 href={item.downloadUrl}

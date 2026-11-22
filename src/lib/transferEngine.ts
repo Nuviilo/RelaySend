@@ -37,7 +37,8 @@ function generateLocalRoomCode(): string {
   return code;
 }
 
-const MAX_CONCURRENT_OUTGOING_PER_PEER = 3;
+const MAX_CONCURRENT_OUTGOING_PER_PEER = 4;
+const BATCH_SIGNAL_CHUNK_SIZE = 40;
 
 interface FileSystemWritableLike {
   write: (data: Uint8Array<ArrayBuffer>) => Promise<void>;
@@ -47,6 +48,7 @@ interface FileSystemWritableLike {
 
 interface FileSystemFileHandleLike {
   createWritable: () => Promise<FileSystemWritableLike>;
+  getFile?: () => Promise<File>;
 }
 
 interface FileSystemDirectoryHandleLike {
@@ -58,6 +60,19 @@ interface FileSystemDirectoryHandleLike {
     name: string,
     options?: {create?: boolean},
   ) => Promise<FileSystemFileHandleLike>;
+  removeEntry?: (name: string) => Promise<void>;
+}
+
+interface RelayDesktopBridge {
+  platform?: string;
+  startFile?: (payload: {
+    transferId: string;
+    fileName: string;
+    relativePath?: string;
+  }) => Promise<{ok: boolean; filePath?: string}>;
+  appendChunk?: (payload: {transferId: string; chunk: Uint8Array}) => Promise<boolean>;
+  finishFile?: (payload: {transferId: string}) => Promise<boolean>;
+  abortFile?: (payload: {transferId: string}) => Promise<void>;
 }
 
 interface SaveFilePickerWindow extends Window {
@@ -67,6 +82,7 @@ interface SaveFilePickerWindow extends Window {
   showDirectoryPicker?: (options?: {
     mode?: 'read' | 'readwrite';
   }) => Promise<FileSystemDirectoryHandleLike>;
+  relayDesktop?: RelayDesktopBridge;
   RelayAndroid?: {
     startFile: (transferId: string, fileName: string, mimeType: string) => boolean;
     startFileInFolder?: (
@@ -111,6 +127,8 @@ interface OutgoingJob {
   doneResolver?: () => void;
 }
 
+type IncomingSinkKind = 'android' | 'desktop' | 'opfs' | 'memory';
+
 interface IncomingJob {
   id: string;
   peerId: string;
@@ -125,8 +143,10 @@ interface IncomingJob {
   lastSpeedTime: number;
   lastSpeedBytes: number;
   transport: TransportMode;
+  sinkKind: IncomingSinkKind;
   writable: FileSystemWritableLike | null;
-  androidSink: boolean;
+  opfsFileHandle: FileSystemFileHandleLike | null;
+  opfsEntryName: string | null;
   memoryChunks: Uint8Array<ArrayBuffer>[];
   writeChain: Promise<void>;
   finalized: boolean;
@@ -161,6 +181,7 @@ export class TransferEngine {
   private blockedPeerIds = new Set<string>();
   private peerActiveOutgoing = new Map<string, number>();
   private peerWaitQueue = new Map<string, Array<() => void>>();
+  private opfsEntryNames = new Map<string, string>();
 
   private clientId: string;
   private deviceName: string;
@@ -437,9 +458,24 @@ export class TransferEngine {
       if (item.downloadUrl) {
         URL.revokeObjectURL(item.downloadUrl);
       }
+      void this.cleanupOpfsTemp(item.id);
     }
     this.listeners.clear();
     this.inviteListeners.clear();
+  }
+
+  private async cleanupOpfsTemp(transferId: string): Promise<void> {
+    const entryName = this.opfsEntryNames.get(transferId);
+    if (!entryName) return;
+    this.opfsEntryNames.delete(transferId);
+    try {
+      const root = (await navigator.storage?.getDirectory?.()) as
+        | FileSystemDirectoryHandleLike
+        | undefined;
+      await root?.removeEntry?.(entryName);
+    } catch {
+      // Ignore cleanup errors
+    }
   }
 
   reconnectToServer(): void {
@@ -829,13 +865,24 @@ export class TransferEngine {
       };
     });
 
+    const jobsToRun: OutgoingJob[] = [];
+
     for (const peer of targets) {
+      const peerBatchMeta: Array<{
+        transferId: string;
+        name: string;
+        relativePath?: string;
+        size: number;
+        mimeType: string;
+      }> = [];
+
       for (const {file, relativePath} of normalizedInputs) {
         const id =
           typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
             ? crypto.randomUUID()
             : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
 
+        const mimeType = file.type || 'application/octet-stream';
         const item: TransferItem = {
           id,
           peerId: peer.id,
@@ -843,7 +890,7 @@ export class TransferEngine {
           name: file.name,
           relativePath,
           size: file.size,
-          mimeType: file.type || 'application/octet-stream',
+          mimeType,
           direction: 'send',
           status: 'waiting',
           bytesTransferred: 0,
@@ -860,37 +907,47 @@ export class TransferEngine {
           cancelled: false,
         };
         this.outgoingJobs.set(id, job);
-        this.emit();
-
-        void this.runOutgoingJob(job);
+        jobsToRun.push(job);
+        peerBatchMeta.push({
+          transferId: id,
+          name: file.name,
+          relativePath,
+          size: file.size,
+          mimeType,
+        });
       }
+
+      if (peerBatchMeta.length === 1) {
+        const single = peerBatchMeta[0];
+        this.sendSignal(peer.id, {
+          kind: 'transfer:offer',
+          transferId: single.transferId,
+          name: single.name,
+          relativePath: single.relativePath,
+          size: single.size,
+          mimeType: single.mimeType,
+        });
+      } else {
+        for (let i = 0; i < peerBatchMeta.length; i += BATCH_SIGNAL_CHUNK_SIZE) {
+          this.sendSignal(peer.id, {
+            kind: 'transfer:batch',
+            transferId: 'batch',
+            items: peerBatchMeta.slice(i, i + BATCH_SIGNAL_CHUNK_SIZE),
+          });
+        }
+      }
+    }
+
+    this.emit();
+
+    for (const job of jobsToRun) {
+      void this.runOutgoingJob(job);
     }
   }
 
   private async runOutgoingJob(job: OutgoingJob): Promise<void> {
     const item = this.transfers.get(job.id);
     if (!item) return;
-
-    await this.acquirePeerSlot(job.peerId);
-    if (job.cancelled || !this.roomState.peers.some((p) => p.id === job.peerId)) {
-      if (item.status === 'waiting') {
-        item.status = job.cancelled ? 'cancelled' : 'error';
-        if (!job.cancelled) item.error = 'Device disconnected';
-        this.emit();
-      }
-      this.outgoingJobs.delete(job.id);
-      this.releasePeerSlot(job.peerId);
-      return;
-    }
-
-    this.sendSignal(job.peerId, {
-      kind: 'transfer:offer',
-      transferId: job.id,
-      name: job.file.name,
-      relativePath: job.relativePath,
-      size: job.file.size,
-      mimeType: job.file.type || 'application/octet-stream',
-    });
 
     const accepted = await new Promise<boolean>((resolve) => {
       job.acceptResolver = resolve;
@@ -899,6 +956,17 @@ export class TransferEngine {
     if (!accepted || job.cancelled) {
       if (item.status === 'waiting') {
         item.status = 'cancelled';
+        this.emit();
+      }
+      this.outgoingJobs.delete(job.id);
+      return;
+    }
+
+    await this.acquirePeerSlot(job.peerId);
+    if (job.cancelled || !this.roomState.peers.some((p) => p.id === job.peerId)) {
+      if (item.status === 'waiting') {
+        item.status = job.cancelled ? 'cancelled' : 'error';
+        if (!job.cancelled) item.error = 'Device disconnected';
         this.emit();
       }
       this.outgoingJobs.delete(job.id);
@@ -1055,97 +1123,146 @@ export class TransferEngine {
     });
   }
 
-  async acceptIncomingTransfer(
-    transferId: string,
-    usePicker = true,
-    targetDirectory?: FileSystemDirectoryHandleLike,
-  ): Promise<void> {
-    const job = this.incomingJobs.get(transferId);
-    const item = this.transfers.get(transferId);
-    if (!job || !item || job.accepted || job.cancelled) return;
-
+  private initIncomingSink(job: IncomingJob): Promise<void> {
     const bridgeWin = window as SaveFilePickerWindow;
-    let writable: FileSystemWritableLike | null = null;
-    let androidSink = false;
 
     if (bridgeWin.RelayAndroid) {
       try {
         const lastSlash = job.relativePath ? job.relativePath.lastIndexOf('/') : -1;
         const relFolder = lastSlash > 0 && job.relativePath ? job.relativePath.slice(0, lastSlash) : '';
-        if (relFolder && typeof bridgeWin.RelayAndroid.startFileInFolder === 'function') {
-          androidSink = bridgeWin.RelayAndroid.startFileInFolder(
-            job.id,
-            job.name,
-            job.mimeType,
-            relFolder,
-          );
-        } else {
-          androidSink = bridgeWin.RelayAndroid.startFile(job.id, job.name, job.mimeType);
+        const ok =
+          relFolder && typeof bridgeWin.RelayAndroid.startFileInFolder === 'function'
+            ? bridgeWin.RelayAndroid.startFileInFolder(job.id, job.name, job.mimeType, relFolder)
+            : bridgeWin.RelayAndroid.startFile(job.id, job.name, job.mimeType);
+        if (ok) {
+          job.sinkKind = 'android';
+          return Promise.resolve();
         }
       } catch {
-        androidSink = false;
+        // Fallback below
       }
     }
 
-    if (!androidSink && targetDirectory) {
-      try {
-        let dir = targetDirectory;
-        if (job.relativePath) {
-          const segments = job.relativePath.split('/');
-          for (let i = 0; i < segments.length - 1; i++) {
-            dir = await dir.getDirectoryHandle(segments[i], {create: true});
+    if (bridgeWin.relayDesktop && typeof bridgeWin.relayDesktop.startFile === 'function') {
+      return bridgeWin.relayDesktop
+        .startFile({
+          transferId: job.id,
+          fileName: job.name,
+          relativePath: job.relativePath,
+        })
+        .then((res) => {
+          if (res?.ok) {
+            job.sinkKind = 'desktop';
           }
-        }
-        const fileHandle = await dir.getFileHandle(job.name, {create: true});
-        writable = await fileHandle.createWritable();
-      } catch {
-        writable = null;
-      }
-    }
-
-    if (!androidSink && !writable && usePicker && typeof bridgeWin.showSaveFilePicker === 'function') {
-      try {
-        const handle = await bridgeWin.showSaveFilePicker({
-          suggestedName: job.name,
+        })
+        .catch(() => {
+          // Fallback below
         });
-        writable = await handle.createWritable();
-      } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') {
-          return;
-        }
-        // Fall back cleanly to Blob streaming if blocked (e.g. iframe / unsupported)
-        writable = null;
-      }
     }
 
-    job.writable = writable;
-    job.androidSink = androidSink;
-    job.accepted = true;
-    job.lastSpeedTime = performance.now();
-    item.status = 'transferring';
-    this.emit();
-
-    this.sendSignal(job.peerId, {
-      kind: 'transfer:accept',
-      transferId: job.id,
-    });
-
-    if (job.size === 0) {
-      await this.finalizeIncomingJob(job);
+    if (typeof navigator !== 'undefined' && typeof navigator.storage?.getDirectory === 'function') {
+      return navigator.storage
+        .getDirectory()
+        .then(async (rawRoot) => {
+          const root = rawRoot as unknown as FileSystemDirectoryHandleLike;
+          const entryName = `relay-${job.id}`;
+          const handle = await root.getFileHandle(entryName, {create: true});
+          if (typeof handle.createWritable !== 'function') return;
+          const writable = await handle.createWritable();
+          job.opfsFileHandle = handle;
+          job.opfsEntryName = entryName;
+          job.writable = writable;
+          job.sinkKind = 'opfs';
+          this.opfsEntryNames.set(job.id, entryName);
+        })
+        .catch(() => {
+          job.writable = null;
+          job.opfsFileHandle = null;
+          job.opfsEntryName = null;
+          job.sinkKind = 'memory';
+        });
     }
+
+    return Promise.resolve();
   }
 
-  async acceptAllIncomingTransfers(): Promise<void> {
-    const waitingIds = this.transferOrder.filter((id) => {
-      const item = this.transfers.get(id);
-      return item && item.direction === 'receive' && item.status === 'waiting';
-    });
-    if (waitingIds.length === 0) return;
+  private registerIncomingTransfer(
+    from: string,
+    peerName: string,
+    spec: {
+      transferId: string;
+      name: string;
+      relativePath?: string;
+      size: number;
+      mimeType: string;
+    },
+  ): IncomingJob {
+    const item: TransferItem = {
+      id: spec.transferId,
+      peerId: from,
+      peerName,
+      name: spec.name,
+      relativePath: spec.relativePath,
+      size: spec.size,
+      mimeType: spec.mimeType,
+      direction: 'receive',
+      status: 'transferring',
+      bytesTransferred: 0,
+      speedBps: 0,
+    };
+    this.transfers.set(spec.transferId, item);
+    this.transferOrder.unshift(spec.transferId);
+
+    const inJob: IncomingJob = {
+      id: spec.transferId,
+      peerId: from,
+      name: spec.name,
+      relativePath: spec.relativePath,
+      size: spec.size,
+      mimeType: spec.mimeType,
+      accepted: true,
+      cancelled: false,
+      bytesReceived: 0,
+      chunksReceived: 0,
+      lastSpeedTime: performance.now(),
+      lastSpeedBytes: 0,
+      transport: 'relay',
+      sinkKind: 'memory',
+      writable: null,
+      opfsFileHandle: null,
+      opfsEntryName: null,
+      memoryChunks: [],
+      writeChain: Promise.resolve(),
+      finalized: false,
+    };
+    inJob.writeChain = this.initIncomingSink(inJob);
+    this.incomingJobs.set(spec.transferId, inJob);
+
+    if (inJob.size === 0) {
+      void this.finalizeIncomingJob(inJob);
+    }
+    return inJob;
+  }
+
+  async saveAllCompletedTransfers(): Promise<void> {
+    const completed = this.transferOrder
+      .map((id) => this.transfers.get(id))
+      .filter(
+        (item): item is TransferItem =>
+          Boolean(
+            item &&
+              item.direction === 'receive' &&
+              item.status === 'completed' &&
+              item.downloadUrl,
+          ),
+      );
+
+    if (completed.length === 0) return;
 
     const bridgeWin = window as SaveFilePickerWindow;
     let targetDir: FileSystemDirectoryHandleLike | undefined;
 
-    if (!bridgeWin.RelayAndroid && typeof bridgeWin.showDirectoryPicker === 'function') {
+    if (typeof bridgeWin.showDirectoryPicker === 'function') {
       try {
         targetDir = await bridgeWin.showDirectoryPicker({mode: 'readwrite'});
       } catch (err) {
@@ -1156,8 +1273,47 @@ export class TransferEngine {
       }
     }
 
-    for (const id of [...waitingIds].reverse()) {
-      await this.acceptIncomingTransfer(id, false, targetDir);
+    if (targetDir) {
+      for (const item of [...completed].reverse()) {
+        if (!item.downloadUrl) continue;
+        try {
+          let dir = targetDir;
+          if (item.relativePath) {
+            const segments = item.relativePath.split('/');
+            for (let i = 0; i < segments.length - 1; i++) {
+              dir = await dir.getDirectoryHandle(segments[i], {create: true});
+            }
+          }
+          const fileHandle = await dir.getFileHandle(item.name, {create: true});
+          const writable = await fileHandle.createWritable();
+          const res = await fetch(item.downloadUrl);
+          if (res.body && typeof (writable as unknown as WritableStream).getWriter === 'function') {
+            await res.body.pipeTo(writable as unknown as WritableStream<Uint8Array>);
+          } else {
+            const buf = new Uint8Array(await res.arrayBuffer());
+            await writable.write(buf);
+            await writable.close();
+          }
+        } catch {
+          this.triggerBrowserDownload(item.downloadUrl, item.name);
+        }
+      }
+      return;
+    }
+
+    for (const item of [...completed].reverse()) {
+      if (!item.downloadUrl) continue;
+      this.triggerBrowserDownload(item.downloadUrl, item.name);
+      await new Promise((r) => window.setTimeout(r, 120));
+    }
+  }
+
+  cancelAllActiveTransfers(): void {
+    for (const id of [...this.transferOrder]) {
+      const item = this.transfers.get(id);
+      if (item && (item.status === 'waiting' || item.status === 'transferring')) {
+        this.cancelTransfer(id);
+      }
     }
   }
 
@@ -1177,9 +1333,16 @@ export class TransferEngine {
     const inJob = this.incomingJobs.get(transferId);
     if (inJob) {
       inJob.cancelled = true;
-      void inJob.writable?.abort?.().catch(() => {});
-      if (inJob.androidSink) {
+      void inJob.writeChain
+        .then(() => inJob.writable?.abort?.())
+        .catch(() => {})
+        .finally(() => {
+          void this.cleanupOpfsTemp(inJob.id);
+        });
+      if (inJob.sinkKind === 'android') {
         (window as SaveFilePickerWindow).RelayAndroid?.abortFile(inJob.id);
+      } else if (inJob.sinkKind === 'desktop') {
+        void (window as SaveFilePickerWindow).relayDesktop?.abortFile?.({transferId: inJob.id});
       }
       inJob.memoryChunks = [];
       this.incomingJobs.delete(transferId);
@@ -1196,6 +1359,7 @@ export class TransferEngine {
     if (item?.downloadUrl) {
       URL.revokeObjectURL(item.downloadUrl);
     }
+    void this.cleanupOpfsTemp(transferId);
     this.transfers.delete(transferId);
     this.transferOrder = this.transferOrder.filter((id) => id !== transferId);
     this.emit();
@@ -1211,6 +1375,7 @@ export class TransferEngine {
         if (item.downloadUrl) {
           URL.revokeObjectURL(item.downloadUrl);
         }
+        void this.cleanupOpfsTemp(id);
         this.transfers.delete(id);
         this.transferOrder = this.transferOrder.filter((x) => x !== id);
       }
@@ -1229,6 +1394,51 @@ export class TransferEngine {
       return;
     }
 
+    if (kind === 'transfer:batch' && Array.isArray(payload.items)) {
+      const peerName = this.roomState.peers.find((p) => p.id === from)?.name || 'Device';
+      const acceptedIds: string[] = [];
+      for (const rawItem of payload.items) {
+        if (!rawItem || typeof rawItem !== 'object') continue;
+        const rec = rawItem as Record<string, unknown>;
+        const tid = typeof rec.transferId === 'string' ? rec.transferId : '';
+        if (!tid) continue;
+        const name = typeof rec.name === 'string' ? rec.name : 'file';
+        const relativePath =
+          typeof rec.relativePath === 'string' ? normalizeRelativePath(rec.relativePath) : undefined;
+        const size = typeof rec.size === 'number' ? rec.size : 0;
+        const mimeType =
+          typeof rec.mimeType === 'string' ? rec.mimeType : 'application/octet-stream';
+        this.registerIncomingTransfer(from, peerName, {
+          transferId: tid,
+          name,
+          relativePath,
+          size,
+          mimeType,
+        });
+        acceptedIds.push(tid);
+      }
+      if (acceptedIds.length > 0) {
+        this.emit();
+        this.sendSignal(from, {
+          kind: 'transfer:batch_accept',
+          transferId: 'batch',
+          transferIds: acceptedIds,
+        });
+      }
+      return;
+    }
+
+    if (kind === 'transfer:batch_accept' && Array.isArray(payload.transferIds)) {
+      for (const rawId of payload.transferIds) {
+        if (typeof rawId !== 'string') continue;
+        const outJob = this.outgoingJobs.get(rawId);
+        if (outJob) {
+          outJob.acceptResolver?.(true);
+        }
+      }
+      return;
+    }
+
     if (!transferId) return;
 
     if (kind === 'transfer:offer') {
@@ -1242,48 +1452,18 @@ export class TransferEngine {
         typeof payload.mimeType === 'string' ? payload.mimeType : 'application/octet-stream';
       const peerName = this.roomState.peers.find((p) => p.id === from)?.name || 'Device';
 
-      const item: TransferItem = {
-        id: transferId,
-        peerId: from,
-        peerName,
+      this.registerIncomingTransfer(from, peerName, {
+        transferId,
         name,
         relativePath,
         size,
         mimeType,
-        direction: 'receive',
-        status: 'waiting',
-        bytesTransferred: 0,
-        speedBps: 0,
-      };
-      this.transfers.set(transferId, item);
-      this.transferOrder.unshift(transferId);
-
-      const inJob: IncomingJob = {
-        id: transferId,
-        peerId: from,
-        name,
-        relativePath,
-        size,
-        mimeType,
-        accepted: false,
-        cancelled: false,
-        bytesReceived: 0,
-        chunksReceived: 0,
-        lastSpeedTime: performance.now(),
-        lastSpeedBytes: 0,
-        transport: 'relay',
-        writable: null,
-        androidSink: false,
-        memoryChunks: [],
-        writeChain: Promise.resolve(),
-        finalized: false,
-      };
-      this.incomingJobs.set(transferId, inJob);
+      });
       this.emit();
-
-      if (this.autoAccept) {
-        void this.acceptIncomingTransfer(transferId, false);
-      }
+      this.sendSignal(from, {
+        kind: 'transfer:accept',
+        transferId,
+      });
       return;
     }
 
@@ -1331,9 +1511,16 @@ export class TransferEngine {
       const inJob = this.incomingJobs.get(transferId);
       if (inJob) {
         inJob.cancelled = true;
-        void inJob.writable?.abort?.().catch(() => {});
-        if (inJob.androidSink) {
+        void inJob.writeChain
+          .then(() => inJob.writable?.abort?.())
+          .catch(() => {})
+          .finally(() => {
+            void this.cleanupOpfsTemp(inJob.id);
+          });
+        if (inJob.sinkKind === 'android') {
           (window as SaveFilePickerWindow).RelayAndroid?.abortFile(inJob.id);
+        } else if (inJob.sinkKind === 'desktop') {
+          void (window as SaveFilePickerWindow).relayDesktop?.abortFile?.({transferId: inJob.id});
         }
         inJob.memoryChunks = [];
         this.incomingJobs.delete(transferId);
@@ -1385,19 +1572,25 @@ export class TransferEngine {
     job.bytesReceived += chunk.length;
     job.chunksReceived += 1;
 
-    if (job.androidSink) {
-      const bridge = (window as SaveFilePickerWindow).RelayAndroid;
-      job.writeChain = job.writeChain.then(() => {
+    job.writeChain = job.writeChain.then(async () => {
+      if (job.cancelled) return;
+      if (job.sinkKind === 'android') {
+        const bridge = (window as SaveFilePickerWindow).RelayAndroid;
         if (!bridge?.appendChunk(job.id, uint8ToBase64(chunk))) {
           throw new Error('Failed writing to Downloads');
         }
-      });
-    } else if (job.writable) {
-      const writable = job.writable;
-      job.writeChain = job.writeChain.then(() => writable.write(chunk));
-    } else {
-      job.memoryChunks.push(chunk);
-    }
+      } else if (job.sinkKind === 'desktop') {
+        const bridge = (window as SaveFilePickerWindow).relayDesktop;
+        const ok = await bridge?.appendChunk?.({transferId: job.id, chunk});
+        if (!ok) {
+          throw new Error('Failed writing to Downloads');
+        }
+      } else if (job.sinkKind === 'opfs' && job.writable) {
+        await job.writable.write(chunk);
+      } else {
+        job.memoryChunks.push(chunk);
+      }
+    });
 
     if (transport === 'relay' && job.chunksReceived % RELAY_ACK_INTERVAL === 0) {
       this.sendSignal(job.peerId, {
@@ -1431,21 +1624,39 @@ export class TransferEngine {
 
     try {
       await job.writeChain;
-      if (job.androidSink) {
+      if (job.sinkKind === 'android') {
         const ok = (window as SaveFilePickerWindow).RelayAndroid?.finishFile(job.id);
         if (!ok) {
           throw new Error('Could not finalize file in Downloads');
         }
         item.savedToDownloads = true;
-      } else if (job.writable) {
+      } else if (job.sinkKind === 'desktop') {
+        const ok = await (window as SaveFilePickerWindow).relayDesktop?.finishFile?.({
+          transferId: job.id,
+        });
+        if (!ok) {
+          throw new Error('Could not finalize file in Downloads');
+        }
+        item.savedToDownloads = true;
+      } else if (job.sinkKind === 'opfs' && job.writable && job.opfsFileHandle) {
         await job.writable.close();
         job.writable = null;
+        if (typeof job.opfsFileHandle.getFile === 'function') {
+          const file = await job.opfsFileHandle.getFile();
+          const url = URL.createObjectURL(file);
+          item.downloadUrl = url;
+          if (this.autoAccept) {
+            this.triggerBrowserDownload(url, job.name);
+          }
+        }
       } else {
         const blob = new Blob(job.memoryChunks, {type: job.mimeType});
         job.memoryChunks = [];
         const url = URL.createObjectURL(blob);
         item.downloadUrl = url;
-        this.triggerBrowserDownload(url, job.name);
+        if (this.autoAccept) {
+          this.triggerBrowserDownload(url, job.name);
+        }
       }
 
       item.status = 'completed';
@@ -1472,29 +1683,5 @@ export class TransferEngine {
     window.setTimeout(() => {
       document.body.removeChild(a);
     }, 100);
-  }
-
-  private failActiveTransfers(reason: string): void {
-    for (const [id, item] of this.transfers.entries()) {
-      if (item.status === 'transferring' || item.status === 'waiting') {
-        item.status = 'error';
-        item.error = reason;
-        const outJob = this.outgoingJobs.get(id);
-        if (outJob) {
-          outJob.cancelled = true;
-          outJob.acceptResolver?.(false);
-          outJob.ackResolver?.();
-          outJob.doneResolver?.();
-        }
-        const inJob = this.incomingJobs.get(id);
-        if (inJob) {
-          inJob.cancelled = true;
-          void inJob.writable?.abort?.().catch(() => {});
-          if (inJob.androidSink) {
-            (window as SaveFilePickerWindow).RelayAndroid?.abortFile(inJob.id);
-          }
-        }
-      }
-    }
   }
 }
