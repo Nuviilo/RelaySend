@@ -1,6 +1,7 @@
 import type {
   DeviceType,
   IncomingInvite,
+  OutgoingFileInput,
   PeerInfo,
   RoomState,
   SavedDevice,
@@ -36,24 +37,58 @@ function generateLocalRoomCode(): string {
   return code;
 }
 
+const MAX_CONCURRENT_OUTGOING_PER_PEER = 3;
+
 interface FileSystemWritableLike {
   write: (data: Uint8Array<ArrayBuffer>) => Promise<void>;
   close: () => Promise<void>;
   abort?: () => Promise<void>;
 }
 
+interface FileSystemFileHandleLike {
+  createWritable: () => Promise<FileSystemWritableLike>;
+}
+
+interface FileSystemDirectoryHandleLike {
+  getDirectoryHandle: (
+    name: string,
+    options?: {create?: boolean},
+  ) => Promise<FileSystemDirectoryHandleLike>;
+  getFileHandle: (
+    name: string,
+    options?: {create?: boolean},
+  ) => Promise<FileSystemFileHandleLike>;
+}
+
 interface SaveFilePickerWindow extends Window {
   showSaveFilePicker?: (options?: {
     suggestedName?: string;
-  }) => Promise<{
-    createWritable: () => Promise<FileSystemWritableLike>;
-  }>;
+  }) => Promise<FileSystemFileHandleLike>;
+  showDirectoryPicker?: (options?: {
+    mode?: 'read' | 'readwrite';
+  }) => Promise<FileSystemDirectoryHandleLike>;
   RelayAndroid?: {
     startFile: (transferId: string, fileName: string, mimeType: string) => boolean;
+    startFileInFolder?: (
+      transferId: string,
+      fileName: string,
+      mimeType: string,
+      relativeFolder: string,
+    ) => boolean;
     appendChunk: (transferId: string, base64Chunk: string) => boolean;
     finishFile: (transferId: string) => boolean;
     abortFile: (transferId: string) => void;
   };
+}
+
+function normalizeRelativePath(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  const parts = raw
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0 && p !== '.' && p !== '..');
+  return parts.length > 1 ? parts.join('/') : undefined;
 }
 
 function uint8ToBase64(bytes: Uint8Array): string {
@@ -69,6 +104,7 @@ interface OutgoingJob {
   id: string;
   peerId: string;
   file: File;
+  relativePath?: string;
   cancelled: boolean;
   acceptResolver?: (accepted: boolean) => void;
   ackResolver?: () => void;
@@ -79,6 +115,7 @@ interface IncomingJob {
   id: string;
   peerId: string;
   name: string;
+  relativePath?: string;
   size: number;
   mimeType: string;
   accepted: boolean;
@@ -112,6 +149,7 @@ export class TransferEngine {
   private ws: WebSocket | null = null;
   private mqtt: MqttMesh | null = null;
   private reconnectTimer: number | null = null;
+  private wsBackoffMs = 3000;
   private primaryHeartbeatTimer: number | null = null;
   private ownsPrimaryId = false;
   private destroyed = false;
@@ -121,6 +159,8 @@ export class TransferEngine {
   private wsPeers: PeerInfo[] = [];
   private mqttPeers: PeerInfo[] = [];
   private blockedPeerIds = new Set<string>();
+  private peerActiveOutgoing = new Map<string, number>();
+  private peerWaitQueue = new Map<string, Array<() => void>>();
 
   private clientId: string;
   private deviceName: string;
@@ -318,6 +358,7 @@ export class TransferEngine {
     this.ws = ws;
 
     ws.onopen = () => {
+      this.wsBackoffMs = 3000;
       this.wsConnected = true;
       this.roomState.connected = true;
       this.roomState.reconnecting = false;
@@ -343,19 +384,24 @@ export class TransferEngine {
       if (this.ws === ws) {
         this.ws = null;
       }
+      const hadWsState = this.wsConnected || this.wsPeers.length > 0;
       this.wsConnected = false;
       this.wsPeers = [];
       this.roomState.connected = this.mqttConnected;
       this.roomState.reconnecting = !this.roomState.connected && !this.destroyed;
-      this.mergeAndSyncPeers();
+      if (hadWsState) {
+        this.mergeAndSyncPeers();
+      }
 
       if (!this.destroyed) {
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
         }
+        const delay = this.wsBackoffMs;
+        this.wsBackoffMs = Math.min(25000, Math.round(this.wsBackoffMs * 1.8));
         this.reconnectTimer = window.setTimeout(() => {
           this.connectWs();
-        }, 4000);
+        }, delay);
       }
     };
 
@@ -402,6 +448,7 @@ export class TransferEngine {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.wsBackoffMs = 3000;
     this.wsConnected = false;
     this.wsPeers = [];
     this.closeAllRtc();
@@ -727,16 +774,63 @@ export class TransferEngine {
     this.rtcPeers.clear();
   }
 
-  async sendFiles(files: File[], targetPeerIds?: string[]): Promise<void> {
+  private acquirePeerSlot(peerId: string): Promise<void> {
+    const active = this.peerActiveOutgoing.get(peerId) || 0;
+    if (active < MAX_CONCURRENT_OUTGOING_PER_PEER) {
+      this.peerActiveOutgoing.set(peerId, active + 1);
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const queue = this.peerWaitQueue.get(peerId) || [];
+      queue.push(resolve);
+      this.peerWaitQueue.set(peerId, queue);
+    });
+  }
+
+  private releasePeerSlot(peerId: string): void {
+    const queue = this.peerWaitQueue.get(peerId);
+    if (queue && queue.length > 0) {
+      const next = queue.shift()!;
+      if (queue.length === 0) {
+        this.peerWaitQueue.delete(peerId);
+      }
+      next();
+      return;
+    }
+    const active = this.peerActiveOutgoing.get(peerId) || 0;
+    if (active <= 1) {
+      this.peerActiveOutgoing.delete(peerId);
+    } else {
+      this.peerActiveOutgoing.set(peerId, active - 1);
+    }
+  }
+
+  async sendFiles(
+    inputs: Array<File | OutgoingFileInput>,
+    targetPeerIds?: string[],
+  ): Promise<void> {
     const targets =
       targetPeerIds && targetPeerIds.length > 0
         ? this.roomState.peers.filter((p) => targetPeerIds.includes(p.id))
         : this.roomState.peers;
 
-    if (targets.length === 0 || files.length === 0) return;
+    if (targets.length === 0 || inputs.length === 0) return;
+
+    const normalizedInputs: OutgoingFileInput[] = inputs.map((entry) => {
+      if (entry instanceof File) {
+        const rel = normalizeRelativePath(
+          (entry as File & {webkitRelativePath?: string}).webkitRelativePath,
+        );
+        return {file: entry, relativePath: rel};
+      }
+      return {
+        file: entry.file,
+        relativePath: normalizeRelativePath(entry.relativePath),
+      };
+    });
 
     for (const peer of targets) {
-      for (const file of files) {
+      for (const {file, relativePath} of normalizedInputs) {
         const id =
           typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
             ? crypto.randomUUID()
@@ -747,6 +841,7 @@ export class TransferEngine {
           peerId: peer.id,
           peerName: peer.name,
           name: file.name,
+          relativePath,
           size: file.size,
           mimeType: file.type || 'application/octet-stream',
           direction: 'send',
@@ -761,6 +856,7 @@ export class TransferEngine {
           id,
           peerId: peer.id,
           file,
+          relativePath,
           cancelled: false,
         };
         this.outgoingJobs.set(id, job);
@@ -775,10 +871,23 @@ export class TransferEngine {
     const item = this.transfers.get(job.id);
     if (!item) return;
 
+    await this.acquirePeerSlot(job.peerId);
+    if (job.cancelled || !this.roomState.peers.some((p) => p.id === job.peerId)) {
+      if (item.status === 'waiting') {
+        item.status = job.cancelled ? 'cancelled' : 'error';
+        if (!job.cancelled) item.error = 'Device disconnected';
+        this.emit();
+      }
+      this.outgoingJobs.delete(job.id);
+      this.releasePeerSlot(job.peerId);
+      return;
+    }
+
     this.sendSignal(job.peerId, {
       kind: 'transfer:offer',
       transferId: job.id,
       name: job.file.name,
+      relativePath: job.relativePath,
       size: job.file.size,
       mimeType: job.file.type || 'application/octet-stream',
     });
@@ -793,6 +902,7 @@ export class TransferEngine {
         this.emit();
       }
       this.outgoingJobs.delete(job.id);
+      this.releasePeerSlot(job.peerId);
       return;
     }
 
@@ -922,6 +1032,7 @@ export class TransferEngine {
       this.emit();
     } finally {
       this.outgoingJobs.delete(job.id);
+      this.releasePeerSlot(job.peerId);
     }
   }
 
@@ -944,7 +1055,11 @@ export class TransferEngine {
     });
   }
 
-  async acceptIncomingTransfer(transferId: string, usePicker = true): Promise<void> {
+  async acceptIncomingTransfer(
+    transferId: string,
+    usePicker = true,
+    targetDirectory?: FileSystemDirectoryHandleLike,
+  ): Promise<void> {
     const job = this.incomingJobs.get(transferId);
     const item = this.transfers.get(transferId);
     if (!job || !item || job.accepted || job.cancelled) return;
@@ -955,13 +1070,40 @@ export class TransferEngine {
 
     if (bridgeWin.RelayAndroid) {
       try {
-        androidSink = bridgeWin.RelayAndroid.startFile(job.id, job.name, job.mimeType);
+        const lastSlash = job.relativePath ? job.relativePath.lastIndexOf('/') : -1;
+        const relFolder = lastSlash > 0 && job.relativePath ? job.relativePath.slice(0, lastSlash) : '';
+        if (relFolder && typeof bridgeWin.RelayAndroid.startFileInFolder === 'function') {
+          androidSink = bridgeWin.RelayAndroid.startFileInFolder(
+            job.id,
+            job.name,
+            job.mimeType,
+            relFolder,
+          );
+        } else {
+          androidSink = bridgeWin.RelayAndroid.startFile(job.id, job.name, job.mimeType);
+        }
       } catch {
         androidSink = false;
       }
     }
 
-    if (!androidSink && usePicker && typeof bridgeWin.showSaveFilePicker === 'function') {
+    if (!androidSink && targetDirectory) {
+      try {
+        let dir = targetDirectory;
+        if (job.relativePath) {
+          const segments = job.relativePath.split('/');
+          for (let i = 0; i < segments.length - 1; i++) {
+            dir = await dir.getDirectoryHandle(segments[i], {create: true});
+          }
+        }
+        const fileHandle = await dir.getFileHandle(job.name, {create: true});
+        writable = await fileHandle.createWritable();
+      } catch {
+        writable = null;
+      }
+    }
+
+    if (!androidSink && !writable && usePicker && typeof bridgeWin.showSaveFilePicker === 'function') {
       try {
         const handle = await bridgeWin.showSaveFilePicker({
           suggestedName: job.name,
@@ -990,6 +1132,32 @@ export class TransferEngine {
 
     if (job.size === 0) {
       await this.finalizeIncomingJob(job);
+    }
+  }
+
+  async acceptAllIncomingTransfers(): Promise<void> {
+    const waitingIds = this.transferOrder.filter((id) => {
+      const item = this.transfers.get(id);
+      return item && item.direction === 'receive' && item.status === 'waiting';
+    });
+    if (waitingIds.length === 0) return;
+
+    const bridgeWin = window as SaveFilePickerWindow;
+    let targetDir: FileSystemDirectoryHandleLike | undefined;
+
+    if (!bridgeWin.RelayAndroid && typeof bridgeWin.showDirectoryPicker === 'function') {
+      try {
+        targetDir = await bridgeWin.showDirectoryPicker({mode: 'readwrite'});
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
+        }
+        targetDir = undefined;
+      }
+    }
+
+    for (const id of [...waitingIds].reverse()) {
+      await this.acceptIncomingTransfer(id, false, targetDir);
     }
   }
 
@@ -1065,6 +1233,10 @@ export class TransferEngine {
 
     if (kind === 'transfer:offer') {
       const name = typeof payload.name === 'string' ? payload.name : 'file';
+      const relativePath =
+        typeof payload.relativePath === 'string'
+          ? normalizeRelativePath(payload.relativePath)
+          : undefined;
       const size = typeof payload.size === 'number' ? payload.size : 0;
       const mimeType =
         typeof payload.mimeType === 'string' ? payload.mimeType : 'application/octet-stream';
@@ -1075,6 +1247,7 @@ export class TransferEngine {
         peerId: from,
         peerName,
         name,
+        relativePath,
         size,
         mimeType,
         direction: 'receive',
@@ -1089,6 +1262,7 @@ export class TransferEngine {
         id: transferId,
         peerId: from,
         name,
+        relativePath,
         size,
         mimeType,
         accepted: false,

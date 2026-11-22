@@ -32,11 +32,17 @@ export type TransferStatus =
 
 export type TransportMode = 'p2p' | 'relay';
 
+export interface OutgoingFileInput {
+  file: File;
+  relativePath?: string;
+}
+
 export interface TransferItem {
   id: string;
   peerId: string;
   peerName: string;
   name: string;
+  relativePath?: string;
   size: number;
   mimeType: string;
   direction: TransferDirection;

@@ -5,8 +5,9 @@ const BROKERS = [
   'wss://broker.hivemq.com:8884/mqtt',
 ];
 const TOPIC_PREFIX = 'relay-share/v1';
-const PRESENCE_INTERVAL_MS = 7000;
-const PEER_TTL_MS = 20000;
+const PRESENCE_INTERVAL_MS = 10000;
+const PEER_TTL_MS = 75000;
+const PRESENCE_DEBOUNCE_MS = 1200;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -96,8 +97,11 @@ interface TrackedPeer extends PeerInfo {
 export class MqttMesh {
   private ws: WebSocket | null = null;
   private brokerIdx = 0;
+  private brokerFailures = 0;
+  private connackReceived = false;
   private destroyed = false;
   private connected = false;
+  private lastPresenceSentAt = 0;
   private rxBuffer: Uint8Array<ArrayBuffer> = new Uint8Array(0);
   private pingTimer: number | null = null;
   private presenceTimer: number | null = null;
@@ -132,10 +136,22 @@ export class MqttMesh {
     if (this.pruneTimer === null) {
       this.pruneTimer = window.setInterval(() => this.pruneExpiredPeers(), 5000);
     }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibilityOrOnline);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', this.handleVisibilityOrOnline);
+    }
   }
 
   destroy(): void {
     this.destroyed = true;
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleVisibilityOrOnline);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', this.handleVisibilityOrOnline);
+    }
     this.publishBye();
     this.clearTimers();
     if (this.pruneTimer !== null) {
@@ -152,6 +168,20 @@ export class MqttMesh {
     }
     this.peers.clear();
   }
+
+  private handleVisibilityOrOnline = (): void => {
+    if (this.destroyed) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (this.connected && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.publishPresence();
+    } else if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+      if (this.reconnectTimer !== null) {
+        window.clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.connectNext();
+    }
+  };
 
   setRoomCode(nextCode: string): void {
     if (!nextCode) return;
@@ -243,11 +273,12 @@ export class MqttMesh {
     }
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
+    this.connackReceived = false;
     this.rxBuffer = new Uint8Array(0);
 
     ws.onopen = () => {
       const mqttId = `relay-${this.clientId}-${Math.random().toString(36).slice(2, 6)}`;
-      ws.send(buildConnectPacket(mqttId, 30));
+      ws.send(buildConnectPacket(mqttId, 60));
     };
 
     ws.onmessage = (event) => {
@@ -271,7 +302,15 @@ export class MqttMesh {
         this.callbacks.onStatusChange(false);
       }
       if (!this.destroyed) {
-        this.brokerIdx = (this.brokerIdx + 1) % BROKERS.length;
+        if (this.connackReceived) {
+          this.brokerFailures = 0;
+        } else {
+          this.brokerFailures += 1;
+          if (this.brokerFailures >= 3) {
+            this.brokerIdx = (this.brokerIdx + 1) % BROKERS.length;
+            this.brokerFailures = 0;
+          }
+        }
         this.scheduleReconnect();
       }
     };
@@ -283,10 +322,11 @@ export class MqttMesh {
 
   private scheduleReconnect(): void {
     if (this.destroyed || this.reconnectTimer !== null) return;
+    const delay = this.connackReceived ? 1200 : 2500;
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       this.connectNext();
-    }, 2000);
+    }, delay);
   }
 
   private clearTimers(): void {
@@ -341,10 +381,12 @@ export class MqttMesh {
     if (packetType === 2) {
       // CONNACK
       if (body.length >= 2 && body[1] === 0) {
+        this.connackReceived = true;
+        this.brokerFailures = 0;
         this.connected = true;
         this.callbacks.onStatusChange(true);
         this.subscribeCurrentRoom();
-        this.publishPresence();
+        this.publishPresence(true);
 
         this.clearTimers();
         this.pingTimer = window.setInterval(() => {
@@ -353,7 +395,7 @@ export class MqttMesh {
           }
         }, 20000);
         this.presenceTimer = window.setInterval(() => {
-          this.publishPresence();
+          this.publishPresence(true);
         }, PRESENCE_INTERVAL_MS);
       }
       return;
@@ -388,8 +430,13 @@ export class MqttMesh {
     this.ws.send(buildSubscribePacket(id, topics));
   }
 
-  private publishPresence(): void {
+  private publishPresence(force = false): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.roomCode) return;
+    const now = Date.now();
+    if (!force && now - this.lastPresenceSentAt < PRESENCE_DEBOUNCE_MS) {
+      return;
+    }
+    this.lastPresenceSentAt = now;
     const topic = `${TOPIC_PREFIX}/${this.roomCode}/presence`;
     const payload = textEncoder.encode(
       JSON.stringify({
@@ -462,8 +509,8 @@ export class MqttMesh {
         const existing = this.peers.get(id);
         const changed = !existing || existing.name !== name || existing.deviceType !== deviceType;
         if (!existing) {
-          // Immediately announce ourselves back so the newcomer discovers us instantly
-          this.publishPresence();
+          // Announce ourselves back so the newcomer discovers us promptly
+          this.publishPresence(false);
         }
         this.peers.set(id, {id, name, deviceType, lastSeen: Date.now()});
         if (changed) {

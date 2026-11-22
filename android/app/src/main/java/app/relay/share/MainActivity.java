@@ -71,12 +71,39 @@ public class MainActivity extends BridgeActivity {
         return raw.replaceAll("[\\\\/:*?\"<>|]", "_");
     }
 
+    private static String sanitizeRelativeFolder(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return "";
+        }
+        String normalized = raw.replace('\\', '/');
+        String[] parts = normalized.split("/");
+        StringBuilder sb = new StringBuilder();
+        for (String part : parts) {
+            String trimmed = part.trim();
+            if (trimmed.isEmpty() || ".".equals(trimmed) || "..".equals(trimmed)) {
+                continue;
+            }
+            String safe = sanitizeFileName(trimmed);
+            if (!safe.isEmpty()) {
+                if (sb.length() > 0) sb.append('/');
+                sb.append(safe);
+            }
+        }
+        return sb.toString();
+    }
+
     public class RelayFileBridge {
         @JavascriptInterface
         public boolean startFile(String transferId, String fileName, String mimeType) {
+            return startFileInFolder(transferId, fileName, mimeType, "");
+        }
+
+        @JavascriptInterface
+        public boolean startFileInFolder(String transferId, String fileName, String mimeType, String relativeFolder) {
             if (transferId == null || transferId.isEmpty()) return false;
             abortInternal(transferId);
             String safeName = sanitizeFileName(fileName);
+            String safeFolder = sanitizeRelativeFolder(relativeFolder);
             String safeMime = (mimeType == null || mimeType.isEmpty()) ? "application/octet-stream" : mimeType;
 
             try {
@@ -85,7 +112,10 @@ public class MainActivity extends BridgeActivity {
                     ContentValues values = new ContentValues();
                     values.put(MediaStore.Downloads.DISPLAY_NAME, safeName);
                     values.put(MediaStore.Downloads.MIME_TYPE, safeMime);
-                    values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                    String relPath = safeFolder.isEmpty()
+                        ? Environment.DIRECTORY_DOWNLOADS
+                        : Environment.DIRECTORY_DOWNLOADS + "/" + safeFolder;
+                    values.put(MediaStore.Downloads.RELATIVE_PATH, relPath);
                     values.put(MediaStore.Downloads.IS_PENDING, 1);
 
                     Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
@@ -98,7 +128,8 @@ public class MainActivity extends BridgeActivity {
                     activeDownloads.put(transferId, new ActiveDownload(os, uri, null));
                     return true;
                 } else {
-                    File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                    File baseDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                    File dir = safeFolder.isEmpty() ? baseDir : new File(baseDir, safeFolder);
                     if (!dir.exists() && !dir.mkdirs()) {
                         return false;
                     }

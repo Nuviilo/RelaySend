@@ -6,6 +6,7 @@ import {
   Check,
   Copy,
   Download,
+  Folder,
   Laptop,
   Moon,
   Pencil,
@@ -30,6 +31,7 @@ import {TransferEngine} from './lib/transferEngine';
 import type {
   DeviceType,
   IncomingInvite,
+  OutgoingFileInput,
   PeerInfo,
   RoomState,
   SavedDevice,
@@ -104,6 +106,88 @@ function detectIsAndroid(): boolean {
   return /Android/i.test(navigator.userAgent || '');
 }
 
+interface DropEntryLike {
+  isFile: boolean;
+  isDirectory: boolean;
+  name: string;
+  file?: (cb: (file: File) => void, errCb?: (err: unknown) => void) => void;
+  createReader?: () => {
+    readEntries: (cb: (entries: DropEntryLike[]) => void, errCb?: (err: unknown) => void) => void;
+  };
+}
+
+async function readEntryRecursively(entry: DropEntryLike, prefix = ''): Promise<OutgoingFileInput[]> {
+  if (entry.isFile && typeof entry.file === 'function') {
+    const getFile = entry.file.bind(entry);
+    return new Promise((resolve) => {
+      getFile(
+        (file) => {
+          const rel = prefix ? `${prefix}/${file.name}` : undefined;
+          resolve([{file, relativePath: rel}]);
+        },
+        () => resolve([]),
+      );
+    });
+  }
+
+  if (entry.isDirectory && typeof entry.createReader === 'function') {
+    const reader = entry.createReader();
+    const childEntries: DropEntryLike[] = [];
+    await new Promise<void>((resolve) => {
+      const readBatch = () => {
+        reader.readEntries(
+          (batch) => {
+            if (!batch || batch.length === 0) {
+              resolve();
+              return;
+            }
+            childEntries.push(...batch);
+            readBatch();
+          },
+          () => resolve(),
+        );
+      };
+      readBatch();
+    });
+
+    const nextPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const nested: OutgoingFileInput[] = [];
+    for (const child of childEntries) {
+      const items = await readEntryRecursively(child, nextPrefix);
+      nested.push(...items);
+    }
+    return nested;
+  }
+
+  return [];
+}
+
+async function extractDroppedFiles(dataTransfer: DataTransfer): Promise<OutgoingFileInput[]> {
+  const items = dataTransfer.items;
+  if (items && items.length > 0) {
+    const entries: DropEntryLike[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i] as unknown as {webkitGetAsEntry?: () => DropEntryLike | null};
+      const entry = typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null;
+      if (entry) {
+        entries.push(entry);
+      }
+    }
+    if (entries.length > 0) {
+      const results: OutgoingFileInput[] = [];
+      for (const entry of entries) {
+        const extracted = await readEntryRecursively(entry);
+        results.push(...extracted);
+      }
+      if (results.length > 0) {
+        return results;
+      }
+    }
+  }
+
+  return Array.from(dataTransfer.files || []).map((file) => ({file}));
+}
+
 export default function App() {
   const initialDevice = useMemo(() => detectDeviceInfo(), []);
   const isAndroid = useMemo(() => detectIsAndroid(), []);
@@ -157,7 +241,16 @@ export default function App() {
   const nativeShell = useMemo(() => isNativeShell(), []);
   const engineRef = useRef<TransferEngine | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
+
+  useEffect(() => {
+    const input = folderInputRef.current;
+    if (input) {
+      input.setAttribute('webkitdirectory', '');
+      input.setAttribute('directory', '');
+    }
+  }, []);
 
   useEffect(() => {
     try {
@@ -390,9 +483,10 @@ export default function App() {
     setPendingInvite(null);
   };
 
-  const dispatchFiles = (fileList: FileList | File[]) => {
-    const files = Array.from(fileList);
-    if (files.length === 0) return;
+  const dispatchFiles = (fileList: FileList | File[] | OutgoingFileInput[]) => {
+    const entries: Array<File | OutgoingFileInput> =
+      fileList instanceof FileList ? Array.from(fileList) : fileList;
+    if (entries.length === 0) return;
 
     if (roomState.peers.length === 0) {
       setNotice('Connect another device first to send files');
@@ -400,12 +494,20 @@ export default function App() {
     }
 
     const targets = selectedPeerIds.length > 0 ? selectedPeerIds : undefined;
-    void engineRef.current?.sendFiles(files, targets);
+    void engineRef.current?.sendFiles(entries, targets);
   };
 
   const handleFileInputChange = (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       dispatchFiles(e.target.files);
+      e.target.value = '';
+    }
+  };
+
+  const handleFolderInputChange = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const files = Array.from(e.target.files);
+      dispatchFiles(files);
       e.target.value = '';
     }
   };
@@ -436,9 +538,13 @@ export default function App() {
     e.stopPropagation();
     dragDepthRef.current = 0;
     setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      dispatchFiles(e.dataTransfer.files);
-    }
+    const dt = e.dataTransfer;
+    if (!dt) return;
+    void extractDroppedFiles(dt).then((files) => {
+      if (files.length > 0) {
+        dispatchFiles(files);
+      }
+    });
   };
 
   const handleToggleAutoAccept = () => {
@@ -450,6 +556,10 @@ export default function App() {
   const hasFinishedTransfers = transfers.some(
     (t) => t.status === 'completed' || t.status === 'cancelled' || t.status === 'error',
   );
+
+  const waitingReceiveCount = transfers.filter(
+    (t) => t.direction === 'receive' && t.status === 'waiting',
+  ).length;
 
   const targetSummary =
     roomState.peers.length === 0
@@ -898,13 +1008,20 @@ export default function App() {
                 onChange={handleFileInputChange}
                 className="hidden"
               />
+              <input
+                ref={folderInputRef}
+                type="file"
+                multiple
+                onChange={handleFolderInputChange}
+                className="hidden"
+              />
 
               <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl border border-zinc-200 bg-zinc-50 text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200">
                 <Upload className="h-5 w-5" />
               </div>
 
               <h2 className="mt-4 text-base font-semibold text-zinc-950 dark:text-white">
-                Drop files to share
+                Drop files or folders to share
               </h2>
               <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">{targetSummary}</p>
 
@@ -912,9 +1029,18 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
-                  className="inline-flex h-11 sm:h-10 items-center justify-center rounded-lg bg-zinc-950 px-5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200 whitespace-nowrap shrink-0"
+                  className="inline-flex h-11 sm:h-10 items-center justify-center gap-2 rounded-lg bg-zinc-950 px-5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200 whitespace-nowrap shrink-0"
                 >
-                  Choose files
+                  <Upload className="h-4 w-4" />
+                  <span>Choose files</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => folderInputRef.current?.click()}
+                  className="inline-flex h-11 sm:h-10 items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-white px-4 text-sm font-medium text-zinc-900 transition-colors hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0"
+                >
+                  <Folder className="h-4 w-4 text-zinc-500 dark:text-zinc-400" />
+                  <span>Choose folder</span>
                 </button>
                 {roomState.peers.length === 0 && (
                   <button
@@ -931,10 +1057,21 @@ export default function App() {
             </div>
 
             <div className="rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-              <div className="flex items-center justify-between gap-4 border-b border-zinc-200 px-5 py-3.5 dark:border-zinc-800">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 px-5 py-3.5 dark:border-zinc-800">
                 <h2 className="text-sm font-semibold text-zinc-950 dark:text-zinc-100">Transfers</h2>
 
-                <div className="flex items-center gap-4">
+                <div className="flex items-center gap-3.5">
+                  {waitingReceiveCount > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => void engineRef.current?.acceptAllIncomingTransfers()}
+                      className="inline-flex h-7 items-center gap-1.5 rounded-md bg-blue-600 px-2.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
+                    >
+                      <Download className="h-3 w-3" />
+                      <span>Save all ({waitingReceiveCount})</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     onClick={handleToggleAutoAccept}
@@ -986,8 +1123,11 @@ export default function App() {
                       <li key={item.id} className="px-5 py-4">
                         <div className="flex items-start justify-between gap-4">
                           <div className="min-w-0 flex-1">
-                            <p className="truncate text-sm font-medium text-zinc-950 dark:text-zinc-100">
-                              {item.name}
+                            <p
+                              className="truncate text-sm font-medium text-zinc-950 dark:text-zinc-100"
+                              title={item.relativePath || item.name}
+                            >
+                              {item.relativePath || item.name}
                             </p>
                             <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400">
                               <span>
