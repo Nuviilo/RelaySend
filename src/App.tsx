@@ -1,5 +1,8 @@
 import {useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent} from 'react';
 import {
+  ArrowUpDown,
+  Bookmark,
+  BookmarkCheck,
   Check,
   Copy,
   Download,
@@ -11,6 +14,7 @@ import {
   Smartphone,
   Sun,
   Tablet,
+  Unlink,
   Upload,
   X,
 } from 'lucide-react';
@@ -23,7 +27,14 @@ import {
   setCustomServerUrl,
 } from './lib/serverConfig';
 import {TransferEngine} from './lib/transferEngine';
-import type {DeviceType, PeerInfo, RoomState, TransferItem} from './types';
+import type {
+  DeviceType,
+  IncomingInvite,
+  PeerInfo,
+  RoomState,
+  SavedDevice,
+  TransferItem,
+} from './types';
 
 function DeviceIcon({type}: {type: DeviceType}) {
   if (type === 'mobile') {
@@ -82,8 +93,21 @@ function getInitialDark(): boolean {
   }
 }
 
+function detectIsAndroid(): boolean {
+  if (typeof window === 'undefined') return false;
+  const win = window as unknown as {
+    RelayAndroid?: unknown;
+    Capacitor?: {getPlatform?: () => string};
+  };
+  if (win.RelayAndroid) return true;
+  if (win.Capacitor?.getPlatform?.() === 'android') return true;
+  return /Android/i.test(navigator.userAgent || '');
+}
+
 export default function App() {
   const initialDevice = useMemo(() => detectDeviceInfo(), []);
+  const isAndroid = useMemo(() => detectIsAndroid(), []);
+  const [mobileTab, setMobileTab] = useState<'devices' | 'files'>('devices');
   const [isDark, setIsDark] = useState<boolean>(getInitialDark);
   const [deviceName, setDeviceName] = useState<string>(() => {
     try {
@@ -115,11 +139,33 @@ export default function App() {
   const [showServerConfig, setShowServerConfig] = useState(false);
   const [serverInput, setServerInput] = useState(() => getCustomServerUrl() || getHttpBaseUrl());
   const [activeServerUrl, setActiveServerUrl] = useState(() => getHttpBaseUrl());
+  const [savedDevices, setSavedDevices] = useState<SavedDevice[]>(() => {
+    try {
+      const raw = localStorage.getItem('relay_saved_devices');
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as SavedDevice[]) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [pendingInvite, setPendingInvite] = useState<IncomingInvite | null>(null);
+
+  const savedDevicesRef = useRef<SavedDevice[]>(savedDevices);
+  savedDevicesRef.current = savedDevices;
 
   const nativeShell = useMemo(() => isNativeShell(), []);
   const engineRef = useRef<TransferEngine | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('relay_saved_devices', JSON.stringify(savedDevices));
+    } catch {
+      // Ignore storage errors
+    }
+  }, [savedDevices]);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDark);
@@ -147,10 +193,28 @@ export default function App() {
       setTransfers(nextTransfers);
     });
 
+    const unsubscribeInvites = engine.subscribeInvites((invite) => {
+      const isKnownSaved = savedDevicesRef.current.some((d) => d.id === invite.from);
+      if (isKnownSaved) {
+        setSavedDevices((prev) =>
+          prev.map((d) =>
+            d.id === invite.from
+              ? {...d, name: invite.name, deviceType: invite.deviceType, lastRoomCode: invite.roomCode}
+              : d,
+          ),
+        );
+        engine.joinRoom(invite.roomCode);
+        setNotice(`Connected to ${invite.name}`);
+      } else {
+        setPendingInvite(invite);
+      }
+    });
+
     engine.connect();
 
     return () => {
       unsubscribe();
+      unsubscribeInvites();
       engine.destroy();
       engineRef.current = null;
     };
@@ -174,7 +238,27 @@ export default function App() {
   useEffect(() => {
     const activeIds = new Set(roomState.peers.map((p) => p.id));
     setSelectedPeerIds((prev) => prev.filter((id) => activeIds.has(id)));
-  }, [roomState.peers]);
+
+    if (roomState.peers.length > 0 && roomState.roomCode) {
+      setSavedDevices((prev) => {
+        let changed = false;
+        const next = prev.map((d) => {
+          const match = roomState.peers.find((p) => p.id === d.id);
+          if (match && (match.name !== d.name || d.lastRoomCode !== roomState.roomCode)) {
+            changed = true;
+            return {
+              ...d,
+              name: match.name,
+              deviceType: match.deviceType,
+              lastRoomCode: roomState.roomCode,
+            };
+          }
+          return d;
+        });
+        return changed ? next : prev;
+      });
+    }
+  }, [roomState.peers, roomState.roomCode]);
 
   useEffect(() => {
     if (!notice) return;
@@ -263,6 +347,49 @@ export default function App() {
     );
   };
 
+  const toggleSaveDevice = (peer: PeerInfo) => {
+    const exists = savedDevices.some((d) => d.id === peer.id);
+    if (exists) {
+      setSavedDevices((prev) => prev.filter((d) => d.id !== peer.id));
+    } else {
+      const entry: SavedDevice = {
+        id: peer.id,
+        name: peer.name,
+        deviceType: peer.deviceType,
+        lastRoomCode: roomState.roomCode,
+        savedAt: Date.now(),
+      };
+      setSavedDevices((prev) => [entry, ...prev.filter((d) => d.id !== peer.id)]);
+    }
+  };
+
+  const handleDisconnectPeer = (peer: PeerInfo) => {
+    engineRef.current?.disconnectPeer(peer.id);
+  };
+
+  const handleDisconnectAll = () => {
+    engineRef.current?.disconnectAll();
+  };
+
+  const handleConnectSaved = (device: SavedDevice) => {
+    const sent = engineRef.current?.inviteSavedDevice(device);
+    if (sent) {
+      setNotice(`Connecting to ${device.name}...`);
+    } else {
+      setNotice('Connecting to network, try again in a moment');
+    }
+  };
+
+  const handleRemoveSaved = (deviceId: string) => {
+    setSavedDevices((prev) => prev.filter((d) => d.id !== deviceId));
+  };
+
+  const handleAcceptInvite = () => {
+    if (!pendingInvite) return;
+    engineRef.current?.joinRoom(pendingInvite.roomCode);
+    setPendingInvite(null);
+  };
+
   const dispatchFiles = (fileList: FileList | File[]) => {
     const files = Array.from(fileList);
     if (files.length === 0) return;
@@ -333,6 +460,10 @@ export default function App() {
           ? `Sending to ${roomState.peers[0].name}`
           : `Sending to all ${roomState.peers.length} devices`;
 
+  const activeTransfersCount = transfers.filter(
+    (t) => t.status === 'waiting' || t.status === 'transferring',
+  ).length;
+
   return (
     <div className="min-h-screen bg-[#FAFAFA] pb-[env(safe-area-inset-bottom)] text-zinc-950 transition-colors dark:bg-zinc-950 dark:text-zinc-100">
       <header className="border-b border-zinc-200 bg-white pt-[env(safe-area-inset-top)] dark:border-zinc-800 dark:bg-zinc-900">
@@ -394,7 +525,11 @@ export default function App() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl px-4 py-6 sm:px-6 sm:py-8">
+      <main
+        className={`mx-auto max-w-5xl px-4 py-6 pb-24 sm:px-6 sm:py-8 ${
+          isAndroid ? 'pb-24 sm:pb-24' : 'lg:pb-8'
+        }`}
+      >
         {notice && (
           <div className="mb-6 flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
             <span>{notice}</span>
@@ -409,9 +544,47 @@ export default function App() {
           </div>
         )}
 
-        <div className="grid grid-cols-1 gap-8 lg:grid-cols-12 items-start">
-          {/* Left column: Connect devices */}
-          <section className="lg:col-span-5 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+        {pendingInvite && (
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm dark:border-zinc-800 dark:bg-zinc-900">
+            <span className="text-zinc-800 dark:text-zinc-200">
+              <strong className="font-semibold">{pendingInvite.name}</strong> wants to connect
+            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleAcceptInvite}
+                className="h-8 rounded-lg bg-blue-600 px-3 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
+              >
+                Connect
+              </button>
+              <button
+                type="button"
+                onClick={() => setPendingInvite(null)}
+                className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-xs font-medium text-zinc-600 transition-colors hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0"
+              >
+                Ignore
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div
+          className={
+            isAndroid
+              ? 'mx-auto max-w-xl'
+              : 'grid grid-cols-1 gap-8 lg:grid-cols-12 items-start'
+          }
+        >
+          {/* Left column / Devices tab */}
+          <section
+            className={`rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900 ${
+              isAndroid
+                ? mobileTab === 'devices'
+                  ? 'block'
+                  : 'hidden'
+                : `${mobileTab === 'devices' ? 'block' : 'hidden lg:block'} lg:col-span-5`
+            }`}
+          >
             <div className="flex items-center justify-between gap-4">
               <h1 className="text-sm font-semibold text-zinc-950 dark:text-zinc-100">Room code</h1>
               <div className="flex items-center gap-1">
@@ -511,11 +684,25 @@ export default function App() {
             </form>
 
             <div className="mt-6 border-t border-zinc-200 pt-6 dark:border-zinc-800">
-              <div className="flex items-center justify-between text-sm">
-                <h2 className="font-semibold text-zinc-950 dark:text-zinc-100">Connected devices</h2>
-                <span className="font-mono text-xs text-zinc-500 tabular-nums dark:text-zinc-400">
-                  {roomState.peers.length}
-                </span>
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <div className="flex items-center gap-2">
+                  <h2 className="font-semibold text-zinc-950 dark:text-zinc-100">
+                    Connected devices
+                  </h2>
+                  <span className="font-mono text-xs text-zinc-500 tabular-nums dark:text-zinc-400">
+                    {roomState.peers.length}
+                  </span>
+                </div>
+                {roomState.peers.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleDisconnectAll}
+                    className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 whitespace-nowrap shrink-0"
+                  >
+                    <Unlink className="h-3 w-3" />
+                    <span>Disconnect all</span>
+                  </button>
+                )}
               </div>
 
               {roomState.peers.length === 0 ? (
@@ -528,22 +715,24 @@ export default function App() {
                 <ul className="mt-3 divide-y divide-zinc-100 dark:divide-zinc-800">
                   {roomState.peers.map((peer) => {
                     const selected = selectedPeerIds.includes(peer.id);
+                    const isSaved = savedDevices.some((d) => d.id === peer.id);
                     return (
-                      <li key={peer.id}>
+                      <li
+                        key={peer.id}
+                        className="flex items-center justify-between gap-2 py-2"
+                      >
                         <button
                           type="button"
                           onClick={() => togglePeerSelection(peer)}
-                          className="flex w-full items-center justify-between gap-3 py-2.5 text-left transition-colors hover:bg-zinc-50 rounded-lg px-2 -mx-2 dark:hover:bg-zinc-800/70"
+                          className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-2 py-1.5 -ml-2 text-left transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-800/70"
                         >
-                          <div className="flex min-w-0 items-center gap-2.5">
-                            <DeviceIcon type={peer.deviceType} />
-                            <span className="truncate text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                              {peer.name}
-                            </span>
-                          </div>
+                          <DeviceIcon type={peer.deviceType} />
+                          <span className="truncate text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                            {peer.name}
+                          </span>
                           {roomState.peers.length > 1 && (
                             <span
-                              className={`text-xs font-medium whitespace-nowrap shrink-0 ${
+                              className={`ml-auto text-xs font-medium whitespace-nowrap shrink-0 ${
                                 selected
                                   ? 'text-blue-600 dark:text-blue-400'
                                   : 'text-zinc-400 dark:text-zinc-500'
@@ -553,10 +742,99 @@ export default function App() {
                             </span>
                           )}
                         </button>
+
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => toggleSaveDevice(peer)}
+                            className={`inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                              isSaved
+                                ? 'text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950/40'
+                                : 'text-zinc-500 hover:bg-zinc-100 hover:text-zinc-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100'
+                            }`}
+                            title={isSaved ? 'Remove from saved devices' : 'Save device'}
+                            aria-label={isSaved ? 'Saved' : 'Save device'}
+                          >
+                            {isSaved ? (
+                              <BookmarkCheck className="h-3.5 w-3.5" />
+                            ) : (
+                              <Bookmark className="h-3.5 w-3.5" />
+                            )}
+                            <span>{isSaved ? 'Saved' : 'Save'}</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleDisconnectPeer(peer)}
+                            className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-red-600 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-red-400 whitespace-nowrap shrink-0"
+                            title="Disconnect device"
+                            aria-label={`Disconnect ${peer.name}`}
+                          >
+                            <Unlink className="h-3.5 w-3.5" />
+                            <span>Disconnect</span>
+                          </button>
+                        </div>
                       </li>
                     );
                   })}
                 </ul>
+              )}
+
+              {savedDevices.length > 0 && (
+                <div className="mt-6 border-t border-zinc-200 pt-6 dark:border-zinc-800">
+                  <div className="flex items-center justify-between text-sm">
+                    <h2 className="font-semibold text-zinc-950 dark:text-zinc-100">
+                      Saved devices
+                    </h2>
+                    <span className="font-mono text-xs text-zinc-500 tabular-nums dark:text-zinc-400">
+                      {savedDevices.length}
+                    </span>
+                  </div>
+
+                  <ul className="mt-3 divide-y divide-zinc-100 dark:divide-zinc-800">
+                    {savedDevices.map((device) => {
+                      const isOnlineHere = roomState.peers.some((p) => p.id === device.id);
+                      return (
+                        <li
+                          key={device.id}
+                          className="flex items-center justify-between gap-2 py-2.5"
+                        >
+                          <div className="flex min-w-0 items-center gap-2.5">
+                            <DeviceIcon type={device.deviceType} />
+                            <span className="truncate text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                              {device.name}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {isOnlineHere ? (
+                              <span className="px-2 text-xs font-medium text-blue-600 dark:text-blue-400 whitespace-nowrap shrink-0">
+                                Connected
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => handleConnectSaved(device)}
+                                className="inline-flex h-8 items-center rounded-lg border border-zinc-200 bg-white px-2.5 text-xs font-medium text-zinc-900 transition-colors hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0"
+                              >
+                                Connect
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveSaved(device.id)}
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-500 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+                              title="Remove saved device"
+                              aria-label={`Remove ${device.name}`}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
               )}
 
               {nativeShell && (
@@ -592,8 +870,16 @@ export default function App() {
             </div>
           </section>
 
-          {/* Right column: Dropzone & transfers */}
-          <section className="lg:col-span-7 space-y-6">
+          {/* Right column / Files tab */}
+          <section
+            className={`space-y-6 ${
+              isAndroid
+                ? mobileTab === 'files'
+                  ? 'block'
+                  : 'hidden'
+                : `${mobileTab === 'files' ? 'block' : 'hidden lg:block'} lg:col-span-7`
+            }`}
+          >
             <div
               onDragEnter={handleDragEnter}
               onDragLeave={handleDragLeave}
@@ -622,7 +908,7 @@ export default function App() {
               </h2>
               <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">{targetSummary}</p>
 
-              <div className="mt-5 flex justify-center">
+              <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
@@ -630,6 +916,17 @@ export default function App() {
                 >
                   Choose files
                 </button>
+                {roomState.peers.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setMobileTab('devices')}
+                    className={`inline-flex h-11 sm:h-10 items-center justify-center rounded-lg border border-zinc-200 bg-white px-4 text-sm font-medium text-zinc-900 transition-colors hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0 ${
+                      isAndroid ? '' : 'lg:hidden'
+                    }`}
+                  >
+                    Connect a device
+                  </button>
+                )}
               </div>
             </div>
 
@@ -817,6 +1114,61 @@ export default function App() {
           </section>
         </div>
       </main>
+
+      <nav
+        aria-label="Primary views"
+        className={`fixed bottom-0 left-0 right-0 z-40 border-t border-zinc-200 bg-white/95 backdrop-blur-md pb-[env(safe-area-inset-bottom)] dark:border-zinc-800 dark:bg-zinc-900/95 ${
+          isAndroid ? 'block' : 'lg:hidden'
+        }`}
+      >
+        <div className="mx-auto grid h-14 max-w-xl grid-cols-2" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mobileTab === 'devices'}
+            onClick={() => setMobileTab('devices')}
+            className={`relative flex flex-col items-center justify-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+              mobileTab === 'devices'
+                ? 'text-blue-600 dark:text-blue-400'
+                : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'
+            }`}
+          >
+            {mobileTab === 'devices' && (
+              <span
+                aria-hidden="true"
+                className="absolute top-0 h-0.5 w-10 rounded-full bg-blue-600 dark:bg-blue-400"
+              />
+            )}
+            <Smartphone className="h-5 w-5" />
+            <span className="text-[11px] font-medium leading-none tabular-nums">
+              {roomState.peers.length > 0 ? `Devices (${roomState.peers.length})` : 'Devices'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mobileTab === 'files'}
+            onClick={() => setMobileTab('files')}
+            className={`relative flex flex-col items-center justify-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+              mobileTab === 'files'
+                ? 'text-blue-600 dark:text-blue-400'
+                : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'
+            }`}
+          >
+            {mobileTab === 'files' && (
+              <span
+                aria-hidden="true"
+                className="absolute top-0 h-0.5 w-10 rounded-full bg-blue-600 dark:bg-blue-400"
+              />
+            )}
+            <ArrowUpDown className="h-5 w-5" />
+            <span className="text-[11px] font-medium leading-none tabular-nums">
+              {activeTransfersCount > 0 ? `Files (${activeTransfersCount})` : 'Files'}
+            </span>
+          </button>
+        </div>
+      </nav>
     </div>
   );
 }

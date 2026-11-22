@@ -1,4 +1,12 @@
-import type {DeviceType, PeerInfo, RoomState, TransferItem, TransportMode} from '../types';
+import type {
+  DeviceType,
+  IncomingInvite,
+  PeerInfo,
+  RoomState,
+  SavedDevice,
+  TransferItem,
+  TransportMode,
+} from '../types';
 import {MqttMesh} from './mqttMesh';
 import {getWsUrl} from './serverConfig';
 
@@ -95,6 +103,7 @@ interface PeerConnectionEntry {
 }
 
 type StateListener = (room: RoomState, transfers: TransferItem[]) => void;
+type InviteListener = (invite: IncomingInvite) => void;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -103,12 +112,15 @@ export class TransferEngine {
   private ws: WebSocket | null = null;
   private mqtt: MqttMesh | null = null;
   private reconnectTimer: number | null = null;
+  private primaryHeartbeatTimer: number | null = null;
+  private ownsPrimaryId = false;
   private destroyed = false;
 
   private wsConnected = false;
   private mqttConnected = false;
   private wsPeers: PeerInfo[] = [];
   private mqttPeers: PeerInfo[] = [];
+  private blockedPeerIds = new Set<string>();
 
   private clientId: string;
   private deviceName: string;
@@ -130,6 +142,7 @@ export class TransferEngine {
   private incomingJobs = new Map<string, IncomingJob>();
   private rtcPeers = new Map<string, PeerConnectionEntry>();
   private listeners = new Set<StateListener>();
+  private inviteListeners = new Set<InviteListener>();
 
   constructor(options: {
     name: string;
@@ -147,21 +160,72 @@ export class TransferEngine {
 
   private loadOrCreateClientId(): string {
     try {
-      const existing = sessionStorage.getItem('relay_client_id');
-      if (existing) return existing;
-      const created = Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-      sessionStorage.setItem('relay_client_id', created);
-      return created;
+      const existingTabId = sessionStorage.getItem('relay_client_id');
+      let persistentId = localStorage.getItem('relay_device_id');
+      if (!persistentId) {
+        persistentId =
+          Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+        localStorage.setItem('relay_device_id', persistentId);
+      }
+
+      if (existingTabId && existingTabId !== persistentId) {
+        return existingTabId;
+      }
+
+      const lastBeat = Number(localStorage.getItem('relay_primary_heartbeat') || '0');
+      const primaryActive = Date.now() - lastBeat < 6000;
+
+      if (!primaryActive || existingTabId === persistentId) {
+        this.ownsPrimaryId = true;
+        localStorage.setItem('relay_primary_heartbeat', String(Date.now()));
+        sessionStorage.setItem('relay_client_id', persistentId);
+        this.startPrimaryHeartbeat();
+        return persistentId;
+      }
+
+      const tabId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+      sessionStorage.setItem('relay_client_id', tabId);
+      return tabId;
     } catch {
       return Math.random().toString(36).slice(2, 14);
     }
   }
+
+  private startPrimaryHeartbeat(): void {
+    if (typeof window === 'undefined' || !this.ownsPrimaryId) return;
+    if (this.primaryHeartbeatTimer === null) {
+      this.primaryHeartbeatTimer = window.setInterval(() => {
+        try {
+          localStorage.setItem('relay_primary_heartbeat', String(Date.now()));
+        } catch {
+          // Ignore storage errors
+        }
+      }, 2000);
+    }
+    window.addEventListener('pagehide', this.releasePrimaryHeartbeat);
+  }
+
+  private releasePrimaryHeartbeat = (): void => {
+    if (!this.ownsPrimaryId) return;
+    try {
+      localStorage.removeItem('relay_primary_heartbeat');
+    } catch {
+      // Ignore storage errors
+    }
+  };
 
   subscribe(listener: StateListener): () => void {
     this.listeners.add(listener);
     listener(this.getRoomSnapshot(), this.getTransfersSnapshot());
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  subscribeInvites(listener: InviteListener): () => void {
+    this.inviteListeners.add(listener);
+    return () => {
+      this.inviteListeners.delete(listener);
     };
   }
 
@@ -220,6 +284,11 @@ export class TransferEngine {
         },
         onDirectBinary: (_from, transferId, chunk) => {
           this.appendIncomingChunk(transferId, chunk, 'relay');
+        },
+        onInboxInvite: (invite) => {
+          for (const listener of this.inviteListeners) {
+            listener(invite);
+          }
         },
       },
     });
@@ -297,6 +366,14 @@ export class TransferEngine {
 
   destroy(): void {
     this.destroyed = true;
+    if (this.primaryHeartbeatTimer !== null) {
+      window.clearInterval(this.primaryHeartbeatTimer);
+      this.primaryHeartbeatTimer = null;
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('pagehide', this.releasePrimaryHeartbeat);
+    }
+    this.releasePrimaryHeartbeat();
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -316,6 +393,7 @@ export class TransferEngine {
       }
     }
     this.listeners.clear();
+    this.inviteListeners.clear();
   }
 
   reconnectToServer(): void {
@@ -341,6 +419,7 @@ export class TransferEngine {
     this.roomState.roomCode = nextCode;
     this.wsPeers = [];
     this.mqttPeers = [];
+    this.blockedPeerIds.clear();
     this.closeAllRtc();
     this.mergeAndSyncPeers();
     this.mqtt?.setRoomCode(nextCode);
@@ -360,6 +439,26 @@ export class TransferEngine {
 
   createNewRoom(): void {
     this.joinRoom(generateLocalRoomCode());
+  }
+
+  disconnectPeer(peerId: string): void {
+    this.sendSignal(peerId, {kind: 'peer:disconnect', transferId: 'peer'});
+    this.blockedPeerIds.add(peerId);
+    this.mergeAndSyncPeers();
+  }
+
+  disconnectAll(): void {
+    for (const peer of this.roomState.peers) {
+      this.sendSignal(peer.id, {kind: 'peer:disconnect', transferId: 'peer'});
+    }
+    this.createNewRoom();
+  }
+
+  inviteSavedDevice(device: SavedDevice): boolean {
+    this.blockedPeerIds.delete(device.id);
+    this.mergeAndSyncPeers();
+    if (!this.roomState.roomCode) return false;
+    return Boolean(this.mqtt?.sendInboxInvite(device.id, this.roomState.roomCode));
   }
 
   renameDevice(newName: string): void {
@@ -398,10 +497,10 @@ export class TransferEngine {
     const myId = this.roomState.myId || this.clientId;
     const mergedMap = new Map<string, PeerInfo>();
     for (const p of this.wsPeers) {
-      if (p.id !== myId) mergedMap.set(p.id, p);
+      if (p.id !== myId && !this.blockedPeerIds.has(p.id)) mergedMap.set(p.id, p);
     }
     for (const p of this.mqttPeers) {
-      if (p.id !== myId && !mergedMap.has(p.id)) {
+      if (p.id !== myId && !this.blockedPeerIds.has(p.id) && !mergedMap.has(p.id)) {
         mergedMap.set(p.id, p);
       }
     }
@@ -954,7 +1053,15 @@ export class TransferEngine {
   private handlePeerSignal(from: string, payload: Record<string, unknown>): void {
     const kind = typeof payload.kind === 'string' ? payload.kind : '';
     const transferId = typeof payload.transferId === 'string' ? payload.transferId : '';
-    if (!kind || !transferId) return;
+    if (!kind) return;
+
+    if (kind === 'peer:disconnect') {
+      this.blockedPeerIds.add(from);
+      this.mergeAndSyncPeers();
+      return;
+    }
+
+    if (!transferId) return;
 
     if (kind === 'transfer:offer') {
       const name = typeof payload.name === 'string' ? payload.name : 'file';

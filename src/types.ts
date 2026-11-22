@@ -6,6 +6,21 @@ export interface PeerInfo {
   deviceType: DeviceType;
 }
 
+export interface SavedDevice {
+  id: string;
+  name: string;
+  deviceType: DeviceType;
+  lastRoomCode: string;
+  savedAt: number;
+}
+
+export interface IncomingInvite {
+  from: string;
+  name: string;
+  deviceType: DeviceType;
+  roomCode: string;
+}
+
 export type TransferDirection = 'send' | 'receive';
 
 export type TransferStatus =

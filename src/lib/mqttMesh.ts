@@ -74,10 +74,18 @@ function buildPublishPacket(topic: string, payload: Uint8Array): Uint8Array<Arra
   return concatBytes([new Uint8Array([0x30]), remLen, varHeader, payload]);
 }
 
+export interface MqttInboxInvite {
+  from: string;
+  name: string;
+  deviceType: DeviceType;
+  roomCode: string;
+}
+
 export interface MqttMeshCallbacks {
   onPeersChange: (peers: PeerInfo[]) => void;
   onDirectJson: (from: string, data: Record<string, unknown>) => void;
   onDirectBinary: (from: string, transferId: string, chunk: Uint8Array<ArrayBuffer>) => void;
+  onInboxInvite: (invite: MqttInboxInvite) => void;
   onStatusChange: (connected: boolean) => void;
 }
 
@@ -146,7 +154,14 @@ export class MqttMesh {
   }
 
   setRoomCode(nextCode: string): void {
-    if (!nextCode || nextCode === this.roomCode) return;
+    if (!nextCode) return;
+    if (nextCode === this.roomCode) {
+      this.emitPeers();
+      if (this.connected) {
+        this.publishPresence();
+      }
+      return;
+    }
     this.publishBye();
     this.roomCode = nextCode;
     this.peers.clear();
@@ -192,6 +207,22 @@ export class MqttMesh {
     payload.set(fromBytes, 2);
     payload.set(tidBytes, 2 + fromBytes.length);
     payload.set(chunk, 2 + fromBytes.length + tidBytes.length);
+    this.ws.send(buildPublishPacket(topic, payload));
+    return true;
+  }
+
+  sendInboxInvite(to: string, roomCode: string): boolean {
+    if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    const topic = `${TOPIC_PREFIX}/inbox/${to}`;
+    const payload = textEncoder.encode(
+      JSON.stringify({
+        kind: 'invite',
+        from: this.clientId,
+        name: this.deviceName,
+        deviceType: this.deviceType,
+        roomCode,
+      }),
+    );
     this.ws.send(buildPublishPacket(topic, payload));
     return true;
   }
@@ -352,6 +383,7 @@ export class MqttMesh {
       `${TOPIC_PREFIX}/${this.roomCode}/presence`,
       `${TOPIC_PREFIX}/${this.roomCode}/to/${this.clientId}`,
       `${TOPIC_PREFIX}/${this.roomCode}/bin/${this.clientId}`,
+      `${TOPIC_PREFIX}/inbox/${this.clientId}`,
     ];
     this.ws.send(buildSubscribePacket(id, topics));
   }
@@ -386,6 +418,25 @@ export class MqttMesh {
     const presenceTopic = `${TOPIC_PREFIX}/${this.roomCode}/presence`;
     const directTopic = `${TOPIC_PREFIX}/${this.roomCode}/to/${this.clientId}`;
     const binTopic = `${TOPIC_PREFIX}/${this.roomCode}/bin/${this.clientId}`;
+    const inboxTopic = `${TOPIC_PREFIX}/inbox/${this.clientId}`;
+
+    if (topic === inboxTopic) {
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(textDecoder.decode(payload)) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      if (msg.kind !== 'invite') return;
+      const from = typeof msg.from === 'string' ? msg.from : '';
+      const roomCode = typeof msg.roomCode === 'string' ? msg.roomCode : '';
+      if (!from || from === this.clientId || !roomCode) return;
+      const name = typeof msg.name === 'string' ? msg.name : 'Device';
+      const deviceType: DeviceType =
+        msg.deviceType === 'mobile' || msg.deviceType === 'tablet' ? msg.deviceType : 'desktop';
+      this.callbacks.onInboxInvite({from, name, deviceType, roomCode});
+      return;
+    }
 
     if (topic === presenceTopic) {
       let msg: Record<string, unknown>;
